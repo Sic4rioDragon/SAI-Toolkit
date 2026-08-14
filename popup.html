@@ -7,14 +7,72 @@
 </head>
 <body>
   <div class="container">
-    <div class="header">
-      <h1>S.AI Toolkit</h1>
-      <p class="subtitle">All settings can be found in "S.AI Toolkit" on the left sidebar in SpicyChat.</p>
-    </div>
-    <div class="sync-section">
-      <button id="syncBtn" class="sync-btn">Sync to Google Drive</button>
+
+    <header class="header">
+      <div class="title-row">
+        <h1>S.AI Toolkit</h1>
+        <span id="version" class="version"></span>
+      </div>
+      <div id="tabStatus" class="tab-status">
+        <span class="dot"></span>
+        <span id="tabStatusText" class="tab-status-text">Checking…</span>
+        <button id="openSpicyBtn" class="link-btn" hidden type="button">Open SpicyChat&nbsp;↗</button>
+      </div>
+      <button id="whatsNewBtn" class="link-btn" type="button">What's New</button>
+    </header>
+
+    <section class="panel">
+      <h2 class="panel-title">Quick toggles</h2>
+
+      <label class="row">
+        <span class="row-label">Classic Theme</span>
+        <span class="switch"><input type="checkbox" data-key="enableClassicStyle"><span class="slider"></span></span>
+      </label>
+      <label class="row">
+        <span class="row-label">Sidebar Layout</span>
+        <span class="switch"><input type="checkbox" data-key="enableSidebarLayout"><span class="slider"></span></span>
+      </label>
+      <label class="row">
+        <span class="row-label">Hide “For You”</span>
+        <span class="switch"><input type="checkbox" data-key="enableHideForYou"><span class="slider"></span></span>
+      </label>
+      <label class="row">
+        <span class="row-label">Generation Stats</span>
+        <span class="switch"><input type="checkbox" data-key="showGenerationStats"><span class="slider"></span></span>
+      </label>
+      <label class="row">
+        <span class="row-label">Page Jump</span>
+        <span class="switch"><input type="checkbox" data-key="enablePageJump"><span class="slider"></span></span>
+      </label>
+      <label class="row">
+        <span class="row-label">Message Recovery</span>
+        <span class="switch"><input type="checkbox" data-key="messageRecoveryEnabled"><span class="slider"></span></span>
+      </label>
+    </section>
+
+    <section class="panel">
+      <h2 class="panel-title">Google Drive</h2>
       <p id="syncStatus" class="sync-status"></p>
-    </div>
+      <button id="syncBtn" class="primary-btn" type="button">Sync now</button>
+
+      <label class="row">
+        <span class="row-label">Auto-sync</span>
+        <span class="switch"><input type="checkbox" id="autoSyncToggle"><span class="slider"></span></span>
+      </label>
+      <label class="row sub-row" id="autoSyncIntervalRow" hidden>
+        <span class="row-label">Interval</span>
+        <select id="autoSyncInterval" class="select">
+          <option value="5">every 5 min</option>
+          <option value="10">every 10 min</option>
+          <option value="15">every 15 min</option>
+        </select>
+      </label>
+    </section>
+
+    <footer class="footer">
+      <p class="subtitle">More settings live in the “S.AI Toolkit” panel on the left sidebar in SpicyChat.</p>
+    </footer>
+
   </div>
   <script src="popup.js"></script>
 </body>

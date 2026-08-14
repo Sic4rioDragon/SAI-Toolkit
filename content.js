@@ -117,6 +117,23 @@ if (typeof storage !== 'undefined' && storage.get) {
     }).catch(() => {});
 }
 
+// Keep the in-memory debug filters in sync with storage. On WebKit/Orion the per-checkbox
+// change/click handlers are unreliable, so the authoritative path is: Save & Refresh writes
+// debugLogFilters to storage (see the save handler) and this listener mirrors it straight
+// into the live object debugLog() reads — independent of DOM events AND of the document_start
+// load race above. This is what makes a disabled category actually stop logging on iOS.
+try {
+    const _storageEvtAPI = (typeof browser !== 'undefined' ? browser : chrome);
+    if (_storageEvtAPI && _storageEvtAPI.storage && _storageEvtAPI.storage.onChanged) {
+        _storageEvtAPI.storage.onChanged.addListener((changes, area) => {
+            if (area === 'local' && changes.debugLogFilters && changes.debugLogFilters.newValue
+                && typeof changes.debugLogFilters.newValue === 'object') {
+                debugLogFilters = { ...debugLogFilters, ...changes.debugLogFilters.newValue };
+            }
+        });
+    }
+} catch (_) {}
+
 // Helper to extract category from log message
 function getLogCategory(message) {
     if (typeof message !== 'string') return null;
@@ -195,10 +212,43 @@ if (window.__saiToolkitLoaded) {
 
 // Listen for ping from background script to confirm content script is running
 const runtimeAPI = typeof browser !== 'undefined' ? browser : chrome;
+
+// Merge-window heartbeat (Orion/iOS). The background asks us (BEGIN) to ping it while it runs a
+// message-silent IndexedDB merge, during which the OS would otherwise suspend it — freezing its
+// event loop AND its watchdog timers (the "Merging data…" stall that previously only a manual page
+// refresh could break). This content script stays alive in the foreground, so an incoming ping every
+// 500ms keeps the background scheduled to completion. Driven by a BEGIN/END handshake so it covers
+// EVERY background merge (manual sync, auto-sync, restore, import), independent of the settings modal.
+let _mergeHeartbeatTimer = null;
+let _mergeHeartbeatStopAt = 0;
+function startMergeHeartbeat() {
+    _mergeHeartbeatStopAt = Date.now() + 120000; // safety: never ping forever if END is lost (bg died)
+    if (_mergeHeartbeatTimer) return;
+    const ping = () => {
+        if (Date.now() > _mergeHeartbeatStopAt) { stopMergeHeartbeat(); return; }
+        try { runtimeAPI.runtime.sendMessage({ type: 'SAI_KEEPALIVE_PING' }, () => { void runtimeAPI.runtime.lastError; }); } catch (_) {}
+    };
+    ping(); // immediate first wake — no gap at merge start
+    _mergeHeartbeatTimer = setInterval(ping, 500);
+}
+function stopMergeHeartbeat() {
+    if (_mergeHeartbeatTimer) { clearInterval(_mergeHeartbeatTimer); _mergeHeartbeatTimer = null; }
+}
+
 if (runtimeAPI && runtimeAPI.runtime && runtimeAPI.runtime.onMessage) {
     runtimeAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (message.type === 'ping') {
             sendResponse({ pong: true });
+            return true;
+        }
+        if (message.type === 'SAI_MERGE_HEARTBEAT_BEGIN') {
+            startMergeHeartbeat();
+            sendResponse({ ok: true });
+            return true;
+        }
+        if (message.type === 'SAI_MERGE_HEARTBEAT_END') {
+            stopMergeHeartbeat();
+            sendResponse({ ok: true });
             return true;
         }
     });
@@ -639,33 +689,324 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
     const MEMORY_DOT_COLOR_KEY = 'memoryDotColor';  // Custom color for memory limit indicator dot
     const HIDE_CREATOR_KEY = 'hideCreatorName';  // Hide bot creator @username link under bot messages
 
-    // Default custom style values
+    // Default custom style values.
+    // Color fields are split per-theme (light/dark) since a color that reads
+    // fine on a dark chat background (e.g. white body text) can be invisible
+    // on a light one. Typography/layout fields aren't a contrast concern, so
+    // they stay shared across both themes.
+    const CUSTOM_STYLE_FLAT_COLOR_FIELDS = [
+        'aiMessageBg', 'userMessageBg', 'highlightBgColor', 'highlightTextColor',
+        'hoverButtonColor', 'creatorLinkColor'
+    ];
+    // Body/Dialogue/Narration are further split by bot vs. user: SpicyChat's
+    // own bubble backgrounds differ by role (the AI's follows the page theme,
+    // the user's stays a fixed dark navy in both themes), so one shared color
+    // per theme can't read well against both. See the CUSTOM_STYLE_RULES
+    // comment below for the rest of this story.
+    const CUSTOM_STYLE_ROLE_COLOR_FIELDS = ['bodyColor', 'spanQuoteColor', 'narrationColor'];
     const DEFAULT_CUSTOM_STYLE = {
-        aiMessageBg: 'rgba(0, 100, 255, 0.1)',
-        userMessageBg: 'rgba(100, 100, 100, 0.1)',
-        bodyColor: '#ffffff',
+        // Measured directly off spicychat.ai with Custom Style off (bg-gray-4,
+        // plain text color, text-sky-10/text-sky-6, --nextui-colorHighlight,
+        // hover:bg-gray-1 for bot; text-sky-6/text-sky-7 — both #8cdfff — for
+        // user) so the unedited defaults are a no-op visually in both themes.
+        light: {
+            aiMessageBg: '#ededed',
+            userMessageBg: '#335566',
+            bot: { bodyColor: '#000000', spanQuoteColor: '#000000', narrationColor: '#316185' },
+            user: { bodyColor: '#ffffff', spanQuoteColor: '#ffffff', narrationColor: '#8cdfff' },
+            highlightBgColor: '#ffdd6d',
+            highlightTextColor: '#000000',
+            hoverButtonColor: '#fcfcfc',
+            creatorLinkColor: ''
+        },
+        dark: {
+            aiMessageBg: 'rgba(100, 100, 100, 0.1)',
+            userMessageBg: 'rgba(0, 100, 255, 0.1)',
+            bot: { bodyColor: '#ffffff', spanQuoteColor: '#ffffff', narrationColor: '#06B7DB' },
+            user: { bodyColor: '#ffffff', spanQuoteColor: '#ffffff', narrationColor: '#8cdfff' },
+            highlightBgColor: '#ffdd6d',
+            highlightTextColor: '#000000',
+            hoverButtonColor: '#292929',
+            creatorLinkColor: ''
+        },
         bodyFontWeight: 'normal',
         bodyFontStyle: 'normal',
         bodyTextDecoration: 'none',
-        spanQuoteColor: '#ffffff',
         spanQuoteFontWeight: 'normal',
         spanQuoteFontStyle: 'normal',
         spanQuoteTextDecoration: 'none',
-        narrationColor: '#06B7DB',
         narrationFontWeight: 'normal',
         narrationFontStyle: 'italic',
         narrationTextDecoration: 'none',
-        highlightBgColor: '#ffdd6d',
-        highlightTextColor: '#000000',
         highlightFontWeight: 'normal',
         highlightFontStyle: 'normal',
         highlightTextDecoration: 'none',
         fontSize: '16px',
         fontFamily: '',
-        hoverButtonColor: '#292929',
-        creatorLinkColor: '',
         backgroundImage: ''
     };
+
+    // Accepts a raw stored/imported customStyleValues in ANY form this codebase
+    // has ever produced: a JSON string, an already-parsed object, the legacy
+    // flat shape (one set of colors, pre-dual-theme), the pre-bot/user-split
+    // { light, dark, ...shared } shape, or the current shape with bot/user
+    // nested under each theme — and always returns a complete, well-formed
+    // object. Legacy values are never written back to storage, so this
+    // re-derives the same result on every read/every future improvement to
+    // DEFAULT_CUSTOM_STYLE — there's nothing to migrate once, up front, that
+    // could go stale.
+    function normalizeCustomStyleValues(raw) {
+        if (typeof raw === 'string') {
+            try { raw = JSON.parse(raw); } catch (e) { raw = null; }
+        }
+        const base = raw && typeof raw === 'object' ? raw : {};
+        const hasProfiles = base.light && typeof base.light === 'object' &&
+                             base.dark && typeof base.dark === 'object';
+
+        const shared = {};
+        Object.keys(DEFAULT_CUSTOM_STYLE).forEach((key) => {
+            if (key === 'light' || key === 'dark') return;
+            shared[key] = base[key] !== undefined ? base[key] : DEFAULT_CUSTOM_STYLE[key];
+        });
+
+        // Merges one saved theme profile (light or dark) against its
+        // defaults. A profile saved before the bot/user split has
+        // bodyColor/spanQuoteColor/narrationColor flat on itself, tuned only
+        // for the AI's bubble — those migrate into "bot" as-is. "user" always
+        // gets fresh native-matched defaults rather than inheriting a color
+        // that was never designed for the user's own fixed-dark bubble (that
+        // mismatch is exactly the bug this split exists to fix).
+        function normalizeProfile(saved, defaults) {
+            saved = saved && typeof saved === 'object' ? saved : {};
+            const flat = {};
+            CUSTOM_STYLE_FLAT_COLOR_FIELDS.forEach((key) => {
+                flat[key] = saved[key] !== undefined ? saved[key] : defaults[key];
+            });
+            const hasRoles = saved.bot && typeof saved.bot === 'object' &&
+                              saved.user && typeof saved.user === 'object';
+            if (hasRoles) {
+                return {
+                    ...flat,
+                    bot: { ...defaults.bot, ...saved.bot },
+                    user: { ...defaults.user, ...saved.user }
+                };
+            }
+            const legacyBot = {};
+            CUSTOM_STYLE_ROLE_COLOR_FIELDS.forEach((key) => {
+                legacyBot[key] = saved[key] !== undefined ? saved[key] : defaults.bot[key];
+            });
+            return { ...flat, bot: legacyBot, user: { ...defaults.user } };
+        }
+
+        if (hasProfiles) {
+            return {
+                light: normalizeProfile(base.light, DEFAULT_CUSTOM_STYLE.light),
+                dark: normalizeProfile(base.dark, DEFAULT_CUSTOM_STYLE.dark),
+                ...shared
+            };
+        }
+
+        // Legacy flat shape: this codebase only ever had one color set before
+        // the light/dark split, and it was tuned against SpicyChat's dark
+        // background (white body text, etc.) — so it migrates into dark.bot
+        // only. Light gets DEFAULT_CUSTOM_STYLE.light (which now matches
+        // SpicyChat's native Light Mode) rather than inheriting colors that
+        // were never designed for a light background — e.g. the legacy
+        // default's white body text would be invisible on the AI bubble's
+        // light-gray background. Existing users see no change in Dark Mode
+        // and a correct, native-looking Light Mode until they customize it
+        // themselves.
+        const legacyFlat = {};
+        CUSTOM_STYLE_FLAT_COLOR_FIELDS.forEach((key) => {
+            legacyFlat[key] = base[key] !== undefined ? base[key] : DEFAULT_CUSTOM_STYLE.dark[key];
+        });
+        const legacyBot = {};
+        CUSTOM_STYLE_ROLE_COLOR_FIELDS.forEach((key) => {
+            legacyBot[key] = base[key] !== undefined ? base[key] : DEFAULT_CUSTOM_STYLE.dark.bot[key];
+        });
+        return {
+            light: {
+                ...DEFAULT_CUSTOM_STYLE.light,
+                bot: { ...DEFAULT_CUSTOM_STYLE.light.bot },
+                user: { ...DEFAULT_CUSTOM_STYLE.light.user }
+            },
+            dark: { ...legacyFlat, bot: legacyBot, user: { ...DEFAULT_CUSTOM_STYLE.dark.user } },
+            ...shared
+        };
+    }
+
+    // Color rule groups shared by both theme profiles. Each entry's selectors
+    // get rendered twice: once unprefixed (light — the default) and once
+    // prefixed with `.dark ` (only applies under a real .dark ancestor, i.e.
+    // SpicyChat's own theme class — not the OS's prefers-color-scheme, which
+    // is a different, unrelated signal).
+    const CUSTOM_STYLE_RULES = [
+        {
+            selectors: [
+                'div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: column"] body',
+                'div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: column"] html',
+                'div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: column"]',
+                'div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2'
+            ],
+            declarations: (c, shared) => `  color: ${c.bot.bodyColor} !important;
+  font-size: ${shared.fontSize} !important;
+  ${shared.fontFamily ? `font-family: ${shared.fontFamily} !important;\n` : ''}  font-weight: ${shared.bodyFontWeight} !important;
+  font-style: ${shared.bodyFontStyle} !important;
+  text-decoration: ${shared.bodyTextDecoration} !important;`
+        },
+        // Body/Dialogue/Narration each get a Bot-scoped and a User-scoped
+        // rule, split on .text-white — that's SpicyChat's own marker for the
+        // user's sent-message text, which renders against a fixed dark bubble
+        // regardless of theme (blumine-6/blumine-3, never gray-4), unlike the
+        // AI's bubble which follows the page theme. Splitting on it (rather
+        // than the old approach of just excluding the user's side) lets both
+        // roles be styled explicitly and independently, while still
+        // defaulting the user's side to colors that are safe against its
+        // always-dark bubble in both themes.
+        {
+            selectors: [
+                'div.p-0[style*="width: 100%"] span.leading-6:not(.text-white)',
+                'div.bg-gray-2 span.leading-6:not(.text-white)'
+            ],
+            declarations: (c, shared) => `  color: ${c.bot.bodyColor} !important;
+  font-size: ${shared.fontSize} !important;
+  ${shared.fontFamily ? `font-family: ${shared.fontFamily} !important;\n` : ''}  font-weight: ${shared.bodyFontWeight} !important;
+  font-style: ${shared.bodyFontStyle} !important;
+  text-decoration: ${shared.bodyTextDecoration} !important;`
+        },
+        {
+            selectors: [
+                'div.p-0[style*="width: 100%"] span.leading-6.text-white',
+                'div.bg-gray-2 span.leading-6.text-white'
+            ],
+            declarations: (c, shared) => `  color: ${c.user.bodyColor} !important;
+  font-size: ${shared.fontSize} !important;
+  ${shared.fontFamily ? `font-family: ${shared.fontFamily} !important;\n` : ''}  font-weight: ${shared.bodyFontWeight} !important;
+  font-style: ${shared.bodyFontStyle} !important;
+  text-decoration: ${shared.bodyTextDecoration} !important;`
+        },
+        {
+            selectors: [
+                'div.p-0[style*="width: 100%"] span.leading-6:not(.text-white) q.text-colorQuote',
+                'div.p-0[style*="width: 100%"] span.leading-6:not(.text-white) q.text-white',
+                'div.bg-gray-2 span.leading-6:not(.text-white) q.text-colorQuote',
+                'div.bg-gray-2 span.leading-6:not(.text-white) q.text-white',
+                'q.leading-\\[1\\.35\\].tracking-\\[0\\.01em\\].text-zinc-900',
+                'q.leading-\\[1\\.35\\].tracking-\\[0\\.01em\\].text-zinc-300',
+                'span.leading-6.mb-\\[10px\\]:not(.text-white) q'
+            ],
+            declarations: (c, shared) => `  color: ${c.bot.spanQuoteColor} !important;
+  ${shared.fontFamily ? `font-family: ${shared.fontFamily} !important;\n` : ''}  font-weight: ${shared.spanQuoteFontWeight} !important;
+  font-style: ${shared.spanQuoteFontStyle} !important;
+  text-decoration: ${shared.spanQuoteTextDecoration} !important;`
+        },
+        {
+            selectors: [
+                'div.p-0[style*="width: 100%"] span.leading-6.text-white q.text-colorQuote',
+                'div.p-0[style*="width: 100%"] span.leading-6.text-white q.text-white',
+                'div.bg-gray-2 span.leading-6.text-white q.text-colorQuote',
+                'div.bg-gray-2 span.leading-6.text-white q.text-white',
+                'span.leading-6.mb-\\[10px\\].text-white q'
+            ],
+            declarations: (c, shared) => `  color: ${c.user.spanQuoteColor} !important;
+  ${shared.fontFamily ? `font-family: ${shared.fontFamily} !important;\n` : ''}  font-weight: ${shared.spanQuoteFontWeight} !important;
+  font-style: ${shared.spanQuoteFontStyle} !important;
+  text-decoration: ${shared.spanQuoteTextDecoration} !important;`
+        },
+        {
+            selectors: [
+                'div.p-0[style*="width: 100%"] em:not(.text-white em)',
+                'div.p-0[style*="width: 100%"] i:not(.text-white i)',
+                'div.p-0[style*="width: 100%"] .narration:not(.text-white .narration)',
+                'div.p-0[style*="width: 100%"] .styled:not(.text-white .styled)',
+                'div.bg-gray-2 em:not(.text-white em)',
+                'div.bg-gray-2 i:not(.text-white i)',
+                'div.bg-gray-2 .narration:not(.text-white .narration)',
+                'div.bg-gray-2 .styled:not(.text-white .styled)'
+            ],
+            declarations: (c, shared) => `  color: ${c.bot.narrationColor} !important;
+  ${shared.fontFamily ? `font-family: ${shared.fontFamily} !important;\n` : ''}  font-weight: ${shared.narrationFontWeight} !important;
+  font-style: ${shared.narrationFontStyle} !important;
+  text-decoration: ${shared.narrationTextDecoration} !important;`
+        },
+        {
+            selectors: [
+                'div.p-0[style*="width: 100%"] .text-white em',
+                'div.p-0[style*="width: 100%"] .text-white i',
+                'div.p-0[style*="width: 100%"] .text-white .narration',
+                'div.p-0[style*="width: 100%"] .text-white .styled',
+                'div.bg-gray-2 .text-white em',
+                'div.bg-gray-2 .text-white i',
+                'div.bg-gray-2 .text-white .narration',
+                'div.bg-gray-2 .text-white .styled'
+            ],
+            declarations: (c, shared) => `  color: ${c.user.narrationColor} !important;
+  ${shared.fontFamily ? `font-family: ${shared.fontFamily} !important;\n` : ''}  font-weight: ${shared.narrationFontWeight} !important;
+  font-style: ${shared.narrationFontStyle} !important;
+  text-decoration: ${shared.narrationTextDecoration} !important;`
+        },
+        {
+            selectors: [
+                'div.p-0[style*="width: 100%"] blockquote.bg-colorHighlight',
+                'div.bg-gray-2 blockquote.bg-colorHighlight',
+                'blockquote.bg-colorHighlight.max-w-max.px-1.rounded-md',
+                'blockquote.bg-colorHighlight.max-w-max.px-1.rounded-md.text-black'
+            ],
+            declarations: (c, shared) => `  background-color: ${c.highlightBgColor} !important;
+  color: ${c.highlightTextColor} !important;
+  ${shared.fontFamily ? `font-family: ${shared.fontFamily} !important;\n` : ''}  font-weight: ${shared.highlightFontWeight} !important;
+  font-style: ${shared.highlightFontStyle} !important;
+  text-decoration: ${shared.highlightTextDecoration} !important;`
+        },
+        {
+            selectors: ['.py-md.rounded-\\[4px_20px_20px_20px\\]'],
+            declarations: (c) => `  background-color: ${c.aiMessageBg} !important;`
+        },
+        {
+            selectors: ['.py-md.rounded-\\[20px_4px_20px_20px\\]'],
+            declarations: (c) => `  background-color: ${c.userMessageBg} !important;`
+        }
+    ];
+
+    function renderCustomStyleProfile(values, profileKey, prefix) {
+        const c = values[profileKey];
+        return CUSTOM_STYLE_RULES.map((rule) => {
+            const selectorList = rule.selectors.map((s) => `${prefix}${s}`).join(',\n');
+            return `${selectorList} {\n${rule.declarations(c, values)}\n}`;
+        }).join('\n\n');
+    }
+
+    function getCustomStyleCSSEarly(valuesJson) {
+        const values = normalizeCustomStyleValues(valuesJson);
+        const light = values.light;
+        const dark = values.dark;
+
+        let css = `/* Custom Style - User Defined Colors and Font Size */
+
+/* Light Mode (default — no .dark ancestor) */
+${renderCustomStyleProfile(values, 'light', '')}
+
+/* Dark Mode */
+${renderCustomStyleProfile(values, 'dark', '.dark ')}`;
+
+        if (light.hoverButtonColor || dark.hoverButtonColor) {
+            css += `\n\n/* Button Hover Color */`;
+            if (light.hoverButtonColor) css += `\nbutton:hover {\n  background-color: ${light.hoverButtonColor} !important;\n}`;
+            if (dark.hoverButtonColor) css += `\n.dark button:hover {\n  background-color: ${dark.hoverButtonColor} !important;\n}`;
+        }
+
+        if (light.creatorLinkColor || dark.creatorLinkColor) {
+            css += `\n\n/* Creator Link Color */`;
+            if (light.creatorLinkColor) css += `\na[aria-label="creator-profile"] p,\na[href^="/creator/"] p.text-link {\n  color: ${light.creatorLinkColor} !important;\n}`;
+            if (dark.creatorLinkColor) css += `\n.dark a[aria-label="creator-profile"] p,\n.dark a[href^="/creator/"] p.text-link {\n  color: ${dark.creatorLinkColor} !important;\n}`;
+        }
+
+        if (values.backgroundImage) {
+            css += `\n\n/* Custom Background Image */\n.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2.relative {\n  background-image: url('${values.backgroundImage}') !important;\n  background-size: cover !important;\n  background-position: center !important;\n  background-repeat: no-repeat !important;\n  background-attachment: fixed !important;\n}`;
+        }
+
+        return css;
+    }
     
     // =============================================================================
     // STORAGE MIGRATION: Classic Theme -> Classic Layout + Classic Style
@@ -798,33 +1139,8 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
     };
 
     // =============================================================================
-    // CHANGELOG - Update notification content for each release
+    // CHANGELOG - see loadChangelogData() / changelog.json for release notes data
     // =============================================================================
-    // Add a new version entry here when releasing a new version
-    // Format: 'version': { title, date, features: [...] }
-    const CHANGELOG = {
-        '1.0.39': {
-            title: 'Version 1.0.39 - Stats Improvements',
-            date: 'January 2, 2026',
-            features: [
-                'Fixed user message timestamps and IDs now displaying correctly',
-                'Improved stats insertion reliability for new messages',
-                'Fixed extension compatibility with /Chat/ URLs (capital C)',
-                'Added better tracking for pending message insertions',
-                'Reduced race conditions in stats processing'
-            ]
-        },
-        '1.0.38': {
-            title: 'Version 1.0.38 - Performance Update',
-            date: 'January 1, 2026',
-            features: [
-                'Massive performance optimizations',
-                'Fixed generation stats injection issues',
-                'Improved message processing speed'
-            ]
-        }
-        // Add more versions as needed above this line
-    };
 
     // Load feature flags from storage (async operations)
     // These determine which CSS to inject before page renders
@@ -1310,22 +1626,38 @@ debugLog('[Stats] Injection script added to page context (EARLY)');
 /* ===== Character info bar full-width background fix ===== */
 /* The character info bar (Iyarin name + buttons) is inside the bg-gray-2 container with background image */
 /* Make it extend full width to cover the background image on the sides */
-div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2.relative > div.flex.w-full.bg-gray-2[class*="z-[2]"] {
-  position: relative;
-  background: var(--color-gray-2, #18181b) !important;
-}
+/* BUGFIX: previously hardcoded background via var(--color-gray-2, #18181b) — that
+   variable is never defined by SpicyChat or this extension, so the !important
+   fallback (#18181b, near-black) applied unconditionally, forcing this bar dark
+   even in Light Mode. The element's own bg-gray-2 class already resolves the
+   correct theme-aware color, so we only need position:relative here. */
+/* BUGFIX: this pseudo-element centers a 100vw-wide box via left:50% + translateX(-50%),
+   which only lands correctly when the bar itself spans the full viewport (true on
+   mobile, where the left nav collapses). On desktop the bar sits to the right of the
+   ~220px-wide persistent left nav, so centering 100vw around it overflows by roughly
+   half the nav's width on BOTH sides — the right-side half pushes past the viewport
+   edge and forces a permanent horizontal scrollbar on the whole page. Scoped to the
+   same mobile breakpoint as the sibling rule below, where the underlying gap this
+   fixes actually exists. */
+@media (max-width: 999px) {
+  div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2.relative > div.flex.w-full.bg-gray-2[class*="z-[2]"] {
+    position: relative;
+  }
 
-/* Use pseudo-element to extend background full width */
-div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2.relative > div.flex.w-full.bg-gray-2[class*="z-[2]"]::before {
-  content: '';
-  position: absolute;
-  top: 0;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 100vw;
-  height: 100%;
-  background: var(--color-gray-2, #18181b);
-  z-index: -1;
+  /* Use pseudo-element to extend background full width */
+  /* background: inherit picks up the parent's real (theme-correct) background
+     instead of a hardcoded color, so this follows Light/Dark mode automatically. */
+  div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2.relative > div.flex.w-full.bg-gray-2[class*="z-[2]"]::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 100vw;
+    height: 100%;
+    background: inherit;
+    z-index: -1;
+  }
 }
 
 /* Message contextual menu (Copy/Edit): reposition to left on mobile devices */
@@ -1542,8 +1874,14 @@ div.fixed.left-1\\/2.top-1\\/2.max-h-\\[700px\\]:has(button[aria-label="Set Mode
 }
 
 /* Force dark gray background on Generation Settings modal to match Memories */
-div.fixed.left-1\\/2.top-1\\/2:not(.size-full):not(.toolkit-modal-container).dark\\:\\!bg-gray-6,
-div.fixed.left-1\\/2.top-1\\/2:not(.size-full):not(.toolkit-modal-container)[class*="bg-white"] {
+/* BUGFIX: previously ungated, so this fired in Light Mode too — one selector
+   matched [class*="bg-white"] (the LIGHT-mode class itself!) and the other
+   matched the literal Tailwind class-name string "dark:!bg-gray-6", which is
+   present in the DOM regardless of which theme is actually active. Scoped to a
+   real .dark ancestor so the override only applies when Dark Mode is genuinely
+   active; in Light Mode the modal's own bg-white already matches Memories. */
+.dark div.fixed.left-1\\/2.top-1\\/2:not(.size-full):not(.toolkit-modal-container).dark\\:\\!bg-gray-6,
+.dark div.fixed.left-1\\/2.top-1\\/2:not(.size-full):not(.toolkit-modal-container)[class*="bg-white"] {
   background-color: rgb(26, 27, 30) !important; /* dark:bg-gray-3 color */
 }
 
@@ -1782,9 +2120,9 @@ div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 {
      reserved track stacks on top of the padding). Keep it 0 so the scrollbar
      sits flush against the right edge. Messages/composer stay readable because
      they're centered via max-width + margin:auto, not via this padding.
-     NOTE: the sidebar-modal-open override (below) and the <1000px rule
-     deliberately re-add 16px — there the gap separates the chat from the
-     pinned right panel / screen edge, which is wanted. */
+     NOTE: the <1000px rule below re-adds 16px for mobile symmetry with the
+     left padding. The sidebar-modal-open override intentionally does NOT —
+     see its own comment for why. */
   padding-right: 0 !important;
   padding-left: 16px !important;
   padding-top: 0px !important;
@@ -1802,9 +2140,18 @@ div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 {
     margin-right: 0 !important;
   }
 
+  /* BUGFIX: padding-right here used to be 16px to "separate the chat from
+     the pinned right panel." But this container is position:relative and
+     its absolutely-positioned scroller child (see comment above) uses its
+     padding box as containing block — so that padding insets the scroller
+     and its native scrollbar away from the sidebar, leaving a visible gap
+     between the scrollbar and the sidebar's left edge instead of the
+     scrollbar sitting flush against it. Keep it 0 like the no-modal case;
+     messages already have plenty of clearance since they're centered at
+     max-width well short of the full container width. */
   body.sai-mm-any-center-modal-open
     div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 {
-    padding-right: 16px !important;
+    padding-right: 0 !important;
     max-height: calc(100vh - 56px) !important;
     flex: 1 1 auto !important;
   }
@@ -2067,143 +2414,6 @@ button:hover {
 .py-md.rounded-\\[20px_4px_20px_20px\\] {
   background-color: rgba(0, 100, 255, .1) !important;
 }
-`;
-    }
-    
-    // =============================================================================
-    // CSS GENERATION FUNCTIONS - Custom Style
-    // =============================================================================
-    // FUNCTION: getCustomStyleCSSEarly()
-    // PURPOSE: Applies user-defined custom colors and font size to messages
-    // FEATURE: "Custom Style" checkbox (colors and font size)
-    // 
-    // WHY NEEDED:
-    // - Allows users to customize message appearance without preset themes
-    // - Provides fine-grained control over colors and typography
-    // - Mutually exclusive with Classic Style to prevent conflicts
-    // 
-    // PARAMETERS:
-    // - valuesJson: JSON string containing custom style values:
-    //   - aiMessageBg: AI message background color
-    //   - userMessageBg: User message background color
-    //   - textColor: Main text color
-    //   - italicColor: Italic/narration text color
-    //   - fontSize: Font size for message text
-    // =============================================================================
-    function getCustomStyleCSSEarly(valuesJson) {
-        let values;
-        try {
-            values = JSON.parse(valuesJson);
-        } catch (e) {
-            debugLog('[Custom Style] Error parsing custom style values, using defaults');
-            values = DEFAULT_CUSTOM_STYLE;
-        }
-        
-        return `
-/* Custom Style - User Defined Colors and Font Size */
-
-/* Body Text Color and Font Settings */
-div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: column"] body,
-div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: column"] html,
-div.p-0[style*="width: 100%"][style*="display: flex"][style*="flex-direction: column"],
-div.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2 {
-  color: ${values.bodyColor} !important;
-  font-size: ${values.fontSize} !important;
-  ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}  font-weight: ${values.bodyFontWeight} !important;
-  font-style: ${values.bodyFontStyle} !important;
-  text-decoration: ${values.bodyTextDecoration} !important;
-}
-
-/* Body Text - Spans (color and font) */
-div.p-0[style*="width: 100%"] span.leading-6,
-div.p-0[style*="width: 100%"] span.text-white,
-div.bg-gray-2 span.leading-6,
-div.bg-gray-2 span.text-white,
-span.leading-6.mb-\\[10px\\].last\\:mb-0.text-white {
-  color: ${values.bodyColor} !important;
-  font-size: ${values.fontSize} !important;
-  ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}  font-weight: ${values.bodyFontWeight} !important;
-  font-style: ${values.bodyFontStyle} !important;
-  text-decoration: ${values.bodyTextDecoration} !important;
-}
-
-/* Quote Text Color (q elements inside spans) */
-div.p-0[style*="width: 100%"] span.text-white q.text-colorQuote,
-div.p-0[style*="width: 100%"] span.text-white q.text-white,
-div.p-0[style*="width: 100%"] span.leading-6 q.text-colorQuote,
-div.p-0[style*="width: 100%"] span.leading-6 q.text-white,
-div.bg-gray-2 span.text-white q.text-colorQuote,
-div.bg-gray-2 span.text-white q.text-white,
-div.bg-gray-2 span.leading-6 q.text-colorQuote,
-div.bg-gray-2 span.leading-6 q.text-white,
-q.leading-\\[1\\.35\\].tracking-\\[0\\.01em\\].text-zinc-900,
-q.leading-\\[1\\.35\\].tracking-\\[0\\.01em\\].text-zinc-300,
-span.leading-6.mb-\\[10px\\].last\\:mb-0.text-white q,
-span.leading-6.mb-\\[10px\\] q {
-  color: ${values.spanQuoteColor} !important;
-  ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}  font-weight: ${values.spanQuoteFontWeight} !important;
-  font-style: ${values.spanQuoteFontStyle} !important;
-  text-decoration: ${values.spanQuoteTextDecoration} !important;
-}
-
-/* Narration Color (em, i, .narration, .styled) */
-div.p-0[style*="width: 100%"] em,
-div.p-0[style*="width: 100%"] i,
-div.p-0[style*="width: 100%"] .narration,
-div.p-0[style*="width: 100%"] .styled,
-div.bg-gray-2 em,
-div.bg-gray-2 i,
-div.bg-gray-2 .narration,
-div.bg-gray-2 .styled,
-em.italic.leading-6.text-sky-6,
-em.italic.leading-6.dark\\:text-sky-7 { 
-  color: ${values.narrationColor} !important;
-  ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}  font-weight: ${values.narrationFontWeight} !important;
-  font-style: ${values.narrationFontStyle} !important;
-  text-decoration: ${values.narrationTextDecoration} !important;
-}
-
-/* Highlight Color (blockquote.bg-colorHighlight) */
-div.p-0[style*="width: 100%"] blockquote.bg-colorHighlight,
-div.bg-gray-2 blockquote.bg-colorHighlight,
-blockquote.bg-colorHighlight.max-w-max.px-1.rounded-md,
-blockquote.bg-colorHighlight.max-w-max.px-1.rounded-md.text-black {
-  background-color: ${values.highlightBgColor} !important;
-  color: ${values.highlightTextColor} !important;
-  ${values.fontFamily ? `font-family: ${values.fontFamily} !important;\n` : ''}  font-weight: ${values.highlightFontWeight} !important;
-  font-style: ${values.highlightFontStyle} !important;
-  text-decoration: ${values.highlightTextDecoration} !important;
-}
-
-/* Message Boxes - Custom Colors */
-
-.py-md.rounded-\\[4px_20px_20px_20px\\] {
-  background-color: ${values.aiMessageBg} !important;
-}
-
-.py-md.rounded-\\[20px_4px_20px_20px\\] {
-  background-color: ${values.userMessageBg} !important;
-}
-
-/* Button Hover Color */
-${values.hoverButtonColor ? `button:hover {
-  background-color: ${values.hoverButtonColor} !important;
-}` : ''}
-
-/* Creator Link Color */
-${values.creatorLinkColor ? `a[aria-label="creator-profile"] p,
-a[href^="/creator/"] p.text-link {
-  color: ${values.creatorLinkColor} !important;
-}` : ''}
-
-/* Custom Background Image */
-${values.backgroundImage ? `.flex.grow.flex-col.top-0.left-0.w-full.h-full.bg-gray-2.relative {
-  background-image: url('${values.backgroundImage}') !important;
-  background-size: cover !important;
-  background-position: center !important;
-  background-repeat: no-repeat !important;
-  background-attachment: fixed !important;
-}` : ''}
 `;
     }
 
@@ -4028,16 +4238,22 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // Reset retry counter on success
         titleUpdateRetries = 0;
         
-        // Extract character name from existing title
-        // Format: "Chat with {name} - AI Sex Chatbot | Spicychat" -> "{name}"
+        // Extract character name from existing title. SpicyChat's own native title
+        // format has changed over time — try both so this survives either one:
+        //   legacy:  "Chat with {name} - AI Sex Chatbot | Spicychat"
+        //   current: "Chat with {name} on Spicychat"
         // Also handle already-shortened format: just "{name}" or "{name} (label)"
         let characterName = null;
-        const fullTitleMatch = document.title.match(/^Chat with (.+) - AI Sex Chatbot \| Spicychat$/);
+        const legacyFullTitleMatch = document.title.match(/^Chat with (.+) - AI Sex Chatbot \| Spicychat$/);
+        const currentFullTitleMatch = document.title.match(/^Chat with (.+) on Spicychat$/);
         const shortTitleMatch = document.title.match(/^([^(]+?)(?:\s*\([^)]+\))?$/);
-        
-        if (fullTitleMatch) {
-            characterName = fullTitleMatch[1];
-            debugLog('[ChatTitle UPDATE]   - Extracted character name from full title:', characterName);
+
+        if (legacyFullTitleMatch) {
+            characterName = legacyFullTitleMatch[1];
+            debugLog('[ChatTitle UPDATE]   - Extracted character name from legacy full title:', characterName);
+        } else if (currentFullTitleMatch) {
+            characterName = currentFullTitleMatch[1];
+            debugLog('[ChatTitle UPDATE]   - Extracted character name from current full title:', characterName);
         } else if (shortTitleMatch && !document.title.includes('Spicychat')) {
             // Already shortened, extract base name (before any label in parentheses)
             characterName = shortTitleMatch[1].trim();
@@ -5914,28 +6130,45 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // Track active message editors globally so we can block arrow keys
         // even when the editor is not focused (user clicked away to read something)
+        // Maps editorId -> the editor element itself (not just a Set of IDs) so
+        // the blocker below can verify an entry is still actually on the page.
         if (!window._activeMessageEditors) {
-            window._activeMessageEditors = new Set();
+            window._activeMessageEditors = new Map();
         }
-        
+
         // Install global arrow key blocker ONCE - blocks when ANY message editor is active
         if (!window._wysiwygGlobalArrowBlockerInstalled) {
             window._wysiwygGlobalArrowBlockerInstalled = true;
-            
+
             // Window capture phase - this fires FIRST before any element handlers
             window.addEventListener('keydown', (e) => {
-                if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || 
+                if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' ||
                     e.key === 'ArrowUp' || e.key === 'ArrowDown') {
-                    
-                    // Check if any message editor is currently active (visible on page)
-                    const hasActiveMessageEditor = window._activeMessageEditors && 
-                                                   window._activeMessageEditors.size > 0;
-                    
+
+                    // Check if any message editor is currently active (visible on page).
+                    // BUGFIX: teardown doesn't always reach the matching .delete() call
+                    // (e.g. the resize/danger-zone cleanup path skips it, and the
+                    // per-editor removal observer can miss an ancestor being removed
+                    // in one shot during a chat switch). A stale entry here used to
+                    // block arrow keys everywhere on the page forever. Validate each
+                    // entry against the live DOM instead of trusting the registry
+                    // blindly, and prune anything that's gone.
+                    let hasActiveMessageEditor = false;
+                    if (window._activeMessageEditors) {
+                        for (const [id, el] of window._activeMessageEditors) {
+                            if (el && el.isConnected) {
+                                hasActiveMessageEditor = true;
+                            } else {
+                                window._activeMessageEditors.delete(id);
+                            }
+                        }
+                    }
+
                     // Check if the WYSIWYG editor itself is focused
                     // If so, let arrow keys through for cursor movement
                     const activeEl = document.activeElement;
                     const isEditorFocused = activeEl && activeEl.classList.contains('sai-wysiwyg-editor');
-                    
+
                     // Block arrow keys when a message editor is active BUT NOT focused
                     // This prevents accidentally switching regenerations while editing
                     // but allows cursor movement when typing in the editor
@@ -5996,77 +6229,81 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
 
             const customStyleEnabled = await storage.get(CUSTOM_STYLE_KEY, false);
             if (customStyleEnabled) {
-                const customStyleValuesStr = await storage.get(CUSTOM_STYLE_VALUES_KEY, JSON.stringify(DEFAULT_CUSTOM_STYLE));
-                let customStyleValues;
-                try {
-                    customStyleValues = typeof customStyleValuesStr === 'string' 
-                        ? JSON.parse(customStyleValuesStr) 
-                        : customStyleValuesStr;
-                } catch (e) {
-                    customStyleValues = DEFAULT_CUSTOM_STYLE;
+                const customStyleValuesRaw = await storage.get(CUSTOM_STYLE_VALUES_KEY, JSON.stringify(DEFAULT_CUSTOM_STYLE));
+                const shared = normalizeCustomStyleValues(customStyleValuesRaw);
+                // Mirror whichever profile matches the SITE's actual current theme
+                // (not the OS's prefers-color-scheme — see the settings modal's own
+                // theme-mismatch note), so the composer always looks like whichever
+                // one is really active instead of e.g. showing white dialogue text
+                // on a light background.
+                const isDark = document.documentElement.classList.contains('dark');
+                const c = isDark ? shared.dark : shared.light;
+
+                // Apply custom colors via CSS variables directly on editor.
+                // The composer is where the user types THEIR OWN message, so
+                // it previews with the "user" role's colors, not "bot" — that
+                // mismatch (previewing AI-bubble colors while composing your
+                // own dialogue) was the root of the original color-bleed bug.
+                if (c.user.bodyColor) {
+                    editor.style.setProperty('--wysiwyg-body-color', c.user.bodyColor);
+                    editor.style.setProperty('--wysiwyg-dialogue-color', c.user.bodyColor);
                 }
-                
-                // Apply custom colors via CSS variables directly on editor
-                if (customStyleValues.bodyColor) {
-                    editor.style.setProperty('--wysiwyg-body-color', customStyleValues.bodyColor);
-                    editor.style.setProperty('--wysiwyg-dialogue-color', customStyleValues.bodyColor);
+                if (shared.bodyFontWeight) {
+                    editor.style.setProperty('--wysiwyg-body-font-weight', shared.bodyFontWeight);
                 }
-                if (customStyleValues.bodyFontWeight) {
-                    editor.style.setProperty('--wysiwyg-body-font-weight', customStyleValues.bodyFontWeight);
+                if (shared.bodyFontStyle) {
+                    editor.style.setProperty('--wysiwyg-body-font-style', shared.bodyFontStyle);
                 }
-                if (customStyleValues.bodyFontStyle) {
-                    editor.style.setProperty('--wysiwyg-body-font-style', customStyleValues.bodyFontStyle);
+                if (shared.bodyTextDecoration) {
+                    editor.style.setProperty('--wysiwyg-body-text-decoration', shared.bodyTextDecoration);
                 }
-                if (customStyleValues.bodyTextDecoration) {
-                    editor.style.setProperty('--wysiwyg-body-text-decoration', customStyleValues.bodyTextDecoration);
-                }
-                
+
                 // Dialogue / Quote settings
-                if (customStyleValues.spanQuoteColor) {
-                    editor.style.setProperty('--wysiwyg-dialogue-color', customStyleValues.spanQuoteColor);
+                if (c.user.spanQuoteColor) {
+                    editor.style.setProperty('--wysiwyg-dialogue-color', c.user.spanQuoteColor);
                 }
-                if (customStyleValues.spanQuoteFontWeight) {
-                    editor.style.setProperty('--wysiwyg-dialogue-font-weight', customStyleValues.spanQuoteFontWeight);
+                if (shared.spanQuoteFontWeight) {
+                    editor.style.setProperty('--wysiwyg-dialogue-font-weight', shared.spanQuoteFontWeight);
                 }
-                if (customStyleValues.spanQuoteFontStyle) {
-                    editor.style.setProperty('--wysiwyg-dialogue-font-style', customStyleValues.spanQuoteFontStyle);
+                if (shared.spanQuoteFontStyle) {
+                    editor.style.setProperty('--wysiwyg-dialogue-font-style', shared.spanQuoteFontStyle);
                 }
-                if (customStyleValues.spanQuoteTextDecoration) {
-                    editor.style.setProperty('--wysiwyg-dialogue-text-decoration', customStyleValues.spanQuoteTextDecoration);
+                if (shared.spanQuoteTextDecoration) {
+                    editor.style.setProperty('--wysiwyg-dialogue-text-decoration', shared.spanQuoteTextDecoration);
                 }
-                
+
                 // Narration settings
-                if (customStyleValues.narrationColor) {
-                    editor.style.setProperty('--wysiwyg-narration-color', customStyleValues.narrationColor);
+                if (c.user.narrationColor) {
+                    editor.style.setProperty('--wysiwyg-narration-color', c.user.narrationColor);
                 }
-                if (customStyleValues.narrationFontWeight) {
-                    editor.style.setProperty('--wysiwyg-narration-font-weight', customStyleValues.narrationFontWeight);
+                if (shared.narrationFontWeight) {
+                    editor.style.setProperty('--wysiwyg-narration-font-weight', shared.narrationFontWeight);
                 }
-                if (customStyleValues.narrationFontStyle) {
-                    editor.style.setProperty('--wysiwyg-narration-font-style', customStyleValues.narrationFontStyle);
+                if (shared.narrationFontStyle) {
+                    editor.style.setProperty('--wysiwyg-narration-font-style', shared.narrationFontStyle);
                 }
-                if (customStyleValues.narrationTextDecoration) {
-                    editor.style.setProperty('--wysiwyg-narration-text-decoration', customStyleValues.narrationTextDecoration);
+                if (shared.narrationTextDecoration) {
+                    editor.style.setProperty('--wysiwyg-narration-text-decoration', shared.narrationTextDecoration);
                 }
-                
+
                 // Highlight settings
-                if (customStyleValues.highlightBgColor) {
-                    editor.style.setProperty('--wysiwyg-highlight-bg', customStyleValues.highlightBgColor);
+                if (c.highlightBgColor) {
+                    editor.style.setProperty('--wysiwyg-highlight-bg', c.highlightBgColor);
                 }
-                if (customStyleValues.highlightTextColor) {
-                    editor.style.setProperty('--wysiwyg-highlight-text', customStyleValues.highlightTextColor);
+                if (c.highlightTextColor) {
+                    editor.style.setProperty('--wysiwyg-highlight-text', c.highlightTextColor);
                 }
-                if (customStyleValues.highlightFontWeight) {
-                    editor.style.setProperty('--wysiwyg-highlight-font-weight', customStyleValues.highlightFontWeight);
+                if (shared.highlightFontWeight) {
+                    editor.style.setProperty('--wysiwyg-highlight-font-weight', shared.highlightFontWeight);
                 }
-                if (customStyleValues.highlightFontStyle) {
-                    editor.style.setProperty('--wysiwyg-highlight-font-style', customStyleValues.highlightFontStyle);
+                if (shared.highlightFontStyle) {
+                    editor.style.setProperty('--wysiwyg-highlight-font-style', shared.highlightFontStyle);
                 }
-                if (customStyleValues.highlightTextDecoration) {
-                    editor.style.setProperty('--wysiwyg-highlight-text-decoration', customStyleValues.highlightTextDecoration);
+                if (shared.highlightTextDecoration) {
+                    editor.style.setProperty('--wysiwyg-highlight-text-decoration', shared.highlightTextDecoration);
                 }
-                
-                debugLog('[WYSIWYG] Applied custom style settings:', customStyleValues);
+
+                debugLog('[WYSIWYG] Applied custom style settings (' + (isDark ? 'dark' : 'light') + ' profile):', c);
             } else {
                 // No Custom Style — if Classic Style is on, mirror ITS fixed palette onto
                 // the live editor so the composer matches what Classic Style renders in sent
@@ -6082,6 +6319,18 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     editor.style.setProperty('--wysiwyg-narration-color', '#06B7DB');
                     editor.style.setProperty('--wysiwyg-narration-font-style', 'italic');
                     debugLog('[WYSIWYG] Applied Classic Style colors to editor');
+                } else if (!document.documentElement.classList.contains('dark')) {
+                    // BUGFIX: neither Custom nor Classic Style active, so the editor
+                    // falls back to .sai-wysiwyg-editor's own CSS variable defaults —
+                    // #ffffff dialogue/body, tuned only for dark mode. In Light Mode
+                    // that's white text on a white composer: invisible. Dark Mode
+                    // already looks right via those same defaults, so only Light Mode
+                    // needs an override here.
+                    editor.style.setProperty('--wysiwyg-body-color', '#000000');
+                    editor.style.setProperty('--wysiwyg-dialogue-color', '#000000');
+                    editor.style.setProperty('--wysiwyg-narration-color', '#316185');
+                    editor.style.setProperty('--wysiwyg-narration-font-style', 'italic');
+                    debugLog('[WYSIWYG] Applied Light Mode default colors to editor');
                 }
             }
         }
@@ -6186,8 +6435,8 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             editor._wysiwygEditorId = editorId;
             textarea._wysiwygEditorId = editorId;
             
-            // Register as active
-            window._activeMessageEditors.add(editorId);
+            // Register as active (store the element so liveness can be verified later)
+            window._activeMessageEditors.set(editorId, editor);
             
             // Watch for editor removal (when user cancels edit or saves)
             const removalObserver = new MutationObserver((mutations) => {
@@ -6371,10 +6620,17 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             debugLog('[WYSIWYG-Text] Formatted HTML:', formattedHtml);
             
             safeSetHTML(editor, formattedHtml);
-            
+
             restoreCursorPosition(savedPos);
-            
-            isUpdating = false;
+
+            // Deferred to a microtask rather than cleared synchronously: the
+            // editorMutationObserver (below) watches for exactly this kind of DOM
+            // write, and MutationObserver callbacks run as microtasks queued at
+            // mutation time — guaranteed to run before this .then() — so isUpdating
+            // is still true when that callback checks it, and it correctly ignores
+            // the mutation this safeSetHTML call just produced instead of treating
+            // it as an external edit and rescheduling another reformat.
+            Promise.resolve().then(() => { isUpdating = false; });
         }
         
         // Sync editor content to textarea.
@@ -6425,7 +6681,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // Initialize editor with textarea content
         function initializeEditor() {
             const formattedHtml = parseFormattedText(textarea.value);
+            // Same isUpdating guard as updateEditorDisplay: this safeSetHTML call is
+            // our own programmatic write, not an external edit, so the
+            // editorMutationObserver (below) must be able to tell the two apart.
+            isUpdating = true;
             safeSetHTML(editor, formattedHtml);
+            Promise.resolve().then(() => { isUpdating = false; });
 
             // Restore editor to editable state (in case it was locked during generation)
             editor.contentEditable = 'true';
@@ -6514,6 +6775,33 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 }
             }, debounceDelay);
         });
+
+        // Watch for editor DOM edits that arrive WITHOUT an 'input' event.
+        // Grammarly (and similar extensions) apply a suggestion in two steps: insert
+        // the corrected text, then remove the original text in a later step that
+        // doesn't dispatch 'input'. The 'input' handler above only resets the
+        // updateEditorDisplay() debounce on 'input', so if that removal lands more
+        // than one debounce window after the insert, updateEditorDisplay() fires on
+        // the transient "both texts present" DOM state and bakes the duplicate in
+        // permanently via safeSetHTML — at which point Grammarly's removal targets
+        // nodes safeSetHTML already replaced and silently does nothing. Treating any
+        // editor mutation like an 'input' event closes that gap.
+        const editorMutationObserver = new MutationObserver(() => {
+            if (isUpdating || isComposing) return;
+            if (editor._wysiwygSending) return;
+
+            lastInputTime = Date.now();
+            syncToTextarea();
+            lastKnownValue = textarea.value;
+
+            clearTimeout(inputDebounceTimer);
+            inputDebounceTimer = setTimeout(() => {
+                if (!isComposing) {
+                    updateEditorDisplay();
+                }
+            }, debounceDelay);
+        });
+        editorMutationObserver.observe(editor, { childList: true, characterData: true, subtree: true });
         
         // Handle paste - strip formatting and paste as plain text
         editor.addEventListener('paste', (e) => {
@@ -6610,18 +6898,24 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     if (shouldRemoveBeforeSend) {
                         debugLog('[WYSIWYG] Removing editor before send - isIOS:', isIOS, 'inDangerZone:', inDangerZone, 'width:', windowWidth);
                         
-                        // Clean up this specific editor's observers and intervals
-                        if (editor._wysiwygResizeObserver) {
-                            editor._wysiwygResizeObserver.disconnect();
-                            delete editor._wysiwygResizeObserver;
+                        // Clean up this specific editor's observers and intervals.
+                        // These are stored on `textarea`, not `editor` — see the
+                        // "Store references for cleanup" block below.
+                        if (textarea._wysiwygResizeObserver) {
+                            textarea._wysiwygResizeObserver.disconnect();
+                            delete textarea._wysiwygResizeObserver;
                         }
-                        if (editor._wysiwygMutationObserver) {
-                            editor._wysiwygMutationObserver.disconnect();
-                            delete editor._wysiwygMutationObserver;
+                        if (textarea._wysiwygMutationObserver) {
+                            textarea._wysiwygMutationObserver.disconnect();
+                            delete textarea._wysiwygMutationObserver;
                         }
-                        if (editor._wysiwygValueCheckInterval) {
-                            clearInterval(editor._wysiwygValueCheckInterval);
-                            delete editor._wysiwygValueCheckInterval;
+                        if (textarea._wysiwygEditorMutationObserver) {
+                            textarea._wysiwygEditorMutationObserver.disconnect();
+                            delete textarea._wysiwygEditorMutationObserver;
+                        }
+                        if (textarea._wysiwygValueCheckInterval) {
+                            clearInterval(textarea._wysiwygValueCheckInterval);
+                            delete textarea._wysiwygValueCheckInterval;
                         }
                         
                         // Make textarea visible again and restore its value
@@ -6876,6 +7170,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         textarea._wysiwygEditor = editor;
         textarea._wysiwygResizeObserver = resizeObserver;
         textarea._wysiwygMutationObserver = textareaObserver;
+        textarea._wysiwygEditorMutationObserver = editorMutationObserver;
         textarea._wysiwygValueCheckInterval = valueCheckInterval;
         textarea._wysiwygInputDebounceTimer = inputDebounceTimer;
     }
@@ -6913,7 +7208,12 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         if (textarea._wysiwygMutationObserver) {
             textarea._wysiwygMutationObserver.disconnect();
         }
-        
+
+        // Clean up editor mutation observer
+        if (textarea._wysiwygEditorMutationObserver) {
+            textarea._wysiwygEditorMutationObserver.disconnect();
+        }
+
         // Clean up value check interval
         if (textarea._wysiwygValueCheckInterval) {
             clearInterval(textarea._wysiwygValueCheckInterval);
@@ -6948,6 +7248,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         delete textarea._wysiwygEditorId;
         delete textarea._wysiwygResizeObserver;
         delete textarea._wysiwygMutationObserver;
+        delete textarea._wysiwygEditorMutationObserver;
         delete textarea._wysiwygValueCheckInterval;
         delete textarea._wysiwygInputDebounceTimer;
     }
@@ -8650,10 +8951,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         try {
             debugLog('[Export] Starting HTML export...');
             
-            // Fetch custom style settings for highlight colors
+            // Fetch custom style settings for highlight colors. The exported
+            // HTML uses its own fixed dark reading theme regardless of the live
+            // site's mode, so it always pulls the dark profile for consistency
+            // with that template's own always-dark palette.
             const customStyleEnabled = await storage.get(CUSTOM_STYLE_KEY, false);
             const customStyleValuesStr = await storage.get(CUSTOM_STYLE_VALUES_KEY, JSON.stringify(DEFAULT_CUSTOM_STYLE));
-            const customStyleValues = JSON.parse(customStyleValuesStr);
+            const customStyleValues = normalizeCustomStyleValues(customStyleValuesStr).dark;
             
             const { messages, character } = await fetchAllChatMessages();
             
@@ -9901,15 +10205,66 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 }
                 
                 /* Custom Style Options */
+                /* BUGFIX: this section was the only one in the modal with no light-mode
+                   colors — every value below was tuned for a dark modal only, so in
+                   Light Mode the labels rendered as low-contrast light-gray text and the
+                   container background was nearly invisible on white. Base values below
+                   are the light-mode colors (matching .setting-desc/.section-title
+                   elsewhere in this stylesheet); the original dark-tuned values now live
+                   in the @media (prefers-color-scheme: dark) overrides, same pattern used
+                   throughout the rest of this modal. */
                 .custom-style-options {
                     display: flex;
                     flex-direction: column;
                     gap: 0.5rem;
                     padding: 0.75rem;
-                    background: rgba(255,255,255,0.05);
+                    background: rgba(0,0,0,0.04);
                     border-radius: 8px;
-                    border: 1px solid rgba(255,255,255,0.1);
+                    border: 1px solid rgba(0,0,0,0.08);
                     margin-top: 0.25rem;
+                }
+                @media (prefers-color-scheme: dark) {
+                    .custom-style-options { background: rgba(255,255,255,0.05); border-color: rgba(255,255,255,0.1); }
+                }
+                .theme-switch-row {
+                    display: flex;
+                    align-items: center;
+                    gap: 0.5rem;
+                    margin-bottom: 0.25rem;
+                }
+                .theme-switch-label {
+                    font-size: 11px;
+                    color: #6b7280;
+                }
+                @media (prefers-color-scheme: dark) {
+                    .theme-switch-label { color: #9ca3af; }
+                }
+                .theme-switch {
+                    display: flex;
+                    gap: 0.2rem;
+                    background: rgba(0,0,0,0.05);
+                    border-radius: 6px;
+                    padding: 2px;
+                }
+                @media (prefers-color-scheme: dark) {
+                    .theme-switch { background: rgba(255,255,255,0.08); }
+                }
+                .theme-switch-btn {
+                    flex: none !important;
+                    padding: 0.25rem 0.6rem !important;
+                    border: none;
+                    border-radius: 4px;
+                    background: transparent;
+                    color: #6b7280;
+                    font-size: 11px !important;
+                    cursor: pointer;
+                }
+                @media (prefers-color-scheme: dark) {
+                    .theme-switch-btn { color: #9ca3af; }
+                }
+                .theme-switch-btn.active {
+                    background: #3b82f6;
+                    color: white;
                 }
                 .style-input-row {
                     display: flex;
@@ -9919,32 +10274,41 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 .style-label {
                     min-width: 100px;
                     flex-shrink: 0;
-                    color: #d1d5db;
+                    color: #374151;
                     font-size: 12px;
                     font-weight: 500;
+                }
+                @media (prefers-color-scheme: dark) {
+                    .style-label { color: #d1d5db; }
                 }
                 .style-label-sub {
                     min-width: 100px;
                     flex-shrink: 0;
-                    color: #9ca3af;
+                    color: #6b7280;
                     font-size: 11px;
                     font-weight: 400;
                     padding-left: 1rem;
+                }
+                @media (prefers-color-scheme: dark) {
+                    .style-label-sub { color: #9ca3af; }
                 }
                 @media (max-width: 380px) {
                     .style-label { min-width: 80px; font-size: 11px; }
                     .style-label-sub { min-width: 70px; font-size: 10px; }
                 }
-                
+
                 /* Text Type Sections (Collapsible) */
                 .text-type-section {
                     display: flex;
                     flex-direction: column;
                     gap: 0.25rem;
                     padding: 0.5rem;
-                    background: rgba(0,0,0,0.2);
+                    background: rgba(0,0,0,0.04);
                     border-radius: 6px;
-                    border: 1px solid rgba(255,255,255,0.05);
+                    border: 1px solid rgba(0,0,0,0.08);
+                }
+                @media (prefers-color-scheme: dark) {
+                    .text-type-section { background: rgba(0,0,0,0.2); border-color: rgba(255,255,255,0.05); }
                 }
                 .text-type-header {
                     display: flex;
@@ -9958,10 +10322,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 }
                 .text-type-caret {
                     font-size: 10px;
-                    color: #9ca3af;
+                    color: #6b7280;
                     transition: transform 0.2s;
                     flex-shrink: 0;
                     width: 12px;
+                }
+                @media (prefers-color-scheme: dark) {
+                    .text-type-caret { color: #9ca3af; }
                 }
                 .text-type-caret.expanded {
                     transform: rotate(90deg);
@@ -10029,12 +10396,17 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     height: 100%;
                     border-radius: 3px;
                 }
+                .font-preview-page {
+                    padding: 0.75rem;
+                    background: #1a1a1a;
+                    border-radius: 6px;
+                    margin-top: 0.5rem;
+                }
                 .font-preview {
                     padding: 0.5rem 0.75rem;
                     background: #1a1a1a;
                     border: 1px solid #555;
                     border-radius: 6px;
-                    margin-top: 0.5rem;
                     text-align: left;
                 }
                 .font-preview-text {
@@ -10080,6 +10452,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             [PAGE_JUMP_KEY]: false,
             'showGenerationStats': false,
             'showModelDetails': true,
+            'compactStats': false,
             'showTimestamp': false,
             'highlightModelChanges': false,
             'autoRegenOnMismatch': false,
@@ -10109,11 +10482,19 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         let classicLayoutEnabled = modalSettings[CLASSIC_LAYOUT_KEY];
         let classicStyleEnabled = modalSettings[CLASSIC_STYLE_KEY];
         let customStyleEnabled = modalSettings[CUSTOM_STYLE_KEY];
-        let customStyleValues = JSON.parse(modalSettings[CUSTOM_STYLE_VALUES_KEY]);
+        let customStyleValues = normalizeCustomStyleValues(modalSettings[CUSTOM_STYLE_VALUES_KEY]);
+        // Which profile the Custom Style panel is currently showing/editing.
+        // Defaults to whatever the site is actually rendering right now, so the
+        // panel opens already showing what you're looking at.
+        let editingStyleProfile = document.documentElement.classList.contains('dark') ? 'dark' : 'light';
+        // Which role's Body/Dialogue/Narration colors the panel is currently
+        // showing/editing — independent of editingStyleProfile above.
+        let editingStyleRole = 'bot';
         let hideForYouEnabled = modalSettings[HIDE_FOR_YOU_KEY];
         let pageJumpEnabled = modalSettings[PAGE_JUMP_KEY];
         let showStatsEnabled = modalSettings['showGenerationStats'];
         let showModelDetailsEnabled = modalSettings['showModelDetails']; // true = show "model → engine", false = show only "model"
+        let compactStatsEnabled = modalSettings['compactStats']; // true = hide stat labels (e.g. "300 | 0.94 | 0.9 | 65")
         let showTimestampEnabled = modalSettings['showTimestamp'];
         let highlightModelChangesEnabled = modalSettings['highlightModelChanges'];
         let autoRegenOnMismatchEnabled = modalSettings['autoRegenOnMismatch'];
@@ -10264,17 +10645,31 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         </div>
                     </label>
                     <div id="custom-style-options" class="custom-style-options hidden">
-                        <div class="style-input-row">
-                            <label class="style-label">Bot Message BG:</label>
+                        <div class="theme-switch-row">
+                            <span class="theme-switch-label">Editing colors for:</span>
+                            <div class="theme-switch">
+                                <button type="button" class="theme-switch-btn" id="theme-switch-light" data-theme="light">☀ Light</button>
+                                <button type="button" class="theme-switch-btn" id="theme-switch-dark" data-theme="dark">🌙 Dark</button>
+                            </div>
+                        </div>
+                        <div class="theme-switch-row">
+                            <span class="theme-switch-label">Colors for:</span>
+                            <div class="theme-switch">
+                                <button type="button" class="theme-switch-btn" id="role-switch-bot" data-role="bot">🤖 Bot</button>
+                                <button type="button" class="theme-switch-btn" id="role-switch-user" data-role="user">🙂 You</button>
+                            </div>
+                        </div>
+                        <div class="style-input-row" id="bot-message-bg-row">
+                            <label class="style-label">Message BG:</label>
                             <input type="text" id="custom-ai-bg" class="style-input" placeholder="rgba(100, 100, 100, 0.1)">
                             <div class="color-preview"><div class="color-preview-inner" id="preview-ai-bg"></div></div>
                         </div>
-                        <div class="style-input-row">
-                            <label class="style-label">User Message BG:</label>
+                        <div class="style-input-row hidden" id="user-message-bg-row">
+                            <label class="style-label">Message BG:</label>
                             <input type="text" id="custom-user-bg" class="style-input" placeholder="rgba(0, 100, 255, 0.1)">
                             <div class="color-preview"><div class="color-preview-inner" id="preview-user-bg"></div></div>
                         </div>
-                        
+
                         <!-- Body Text Section -->
                         <div class="text-type-section">
                             <div class="text-type-header" data-target="body-text-options">
@@ -10472,8 +10867,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                             <label class="style-label">Font Family:</label>
                             <input type="text" id="custom-font-family" class="style-input" placeholder="Arial, sans-serif">
                         </div>
-                        <div class="font-preview" id="font-preview-box">
-                            <div class="font-preview-text" id="font-preview-text"><span class="preview-quote" id="preview-text-quote">&quot;Go right ahead, dearie!&quot;</span> <span class="preview-narration" id="preview-text-narration">Elara smiles. Her phone buzzes.</span> <span class="preview-highlight" id="preview-text-highlight">The drop has been made.</span></div>
+                        <div class="font-preview-page" id="font-preview-page">
+                            <div class="font-preview" id="font-preview-box">
+                                <div class="font-preview-text" id="font-preview-text"><span class="preview-quote" id="preview-text-quote">&quot;Go right ahead, dearie!&quot;</span> <span class="preview-narration" id="preview-text-narration">Elara smiles. Her phone buzzes.</span> <span class="preview-highlight" id="preview-text-highlight">The drop has been made.</span></div>
+                            </div>
                         </div>
                         <div class="style-input-row">
                             <label class="style-label">Button Hover:</label>
@@ -10573,6 +10970,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                             <div class="setting-desc">Show "Model → Engine" format</div>
                         </div>
                     </label>
+                    <label class="sub-setting-row hidden" id="compact-stats-row">
+                        <input type="checkbox" class="setting-checkbox" id="compact-stats-checkbox" autocomplete="off">
+                        <div class="sub-setting-text">
+                            <div class="sub-setting-title">Compact Stats</div>
+                            <div class="setting-desc">Hide labels: "300 | 0.94 | 0.9 | 65"</div>
+                        </div>
+                    </label>
                     <label class="setting-row">
                         <input type="checkbox" class="setting-checkbox" id="showtimestamp-checkbox" autocomplete="off">
                         <div class="setting-text">
@@ -10660,7 +11064,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                             <div class="setting-desc">Save messages locally when SpicyChat fails to send them, and offer one-click recovery</div>
                         </div>
                     </label>
-                    <label class="setting-row">
+                    <!-- Hidden from the UI: SpicyChat no longer shows a per-message creator
+                         name in group chats, which is what this was originally built to hide,
+                         so the setting no longer does anything useful (its selector still
+                         matches the unrelated creator-profile link, hiding that everywhere
+                         instead). Kept fully wired up — storage key, CSS injection, import/
+                         export — so it's a one-line revert if SpicyChat brings that UI back. -->
+                    <label class="setting-row hidden" id="hide-creator-row">
                         <input type="checkbox" class="setting-checkbox" id="hide-creator-checkbox" autocomplete="off">
                         <div class="setting-text">
                             <div class="setting-title">Hide Creator Name</div>
@@ -10757,8 +11167,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     <div class="data-buttons" style="margin-top: 0.5rem;">
                         <button class="btn-data" id="clear-all-btn" style="background: #dc2626; border-color: #dc2626; color: white;">Clear All Data</button>
                     </div>
-                    
-                    <div class="version-text" id="version-text">v1.0.69.29</div>
+
+                    <div class="section-title">What's New</div>
+                    <div class="section-desc">See what changed in recent releases</div>
+                    <div class="data-buttons">
+                        <button class="btn-data" id="view-whats-new-btn">View Changelog</button>
+                    </div>
+
+                    <div class="version-text" id="version-text">v1.2</div>
                     
                     <!-- Debug Log Filters (only visible in debug mode) -->
                     <div id="debug-filters-section" class="hidden" style="margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid rgba(255,255,255,0.1);">
@@ -10849,8 +11265,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const classicStyleCheckbox = shadow.querySelector('#classic-style-checkbox');
         const customStyleCheckbox = shadow.querySelector('#custom-style-checkbox');
         const customStyleOptions = shadow.querySelector('#custom-style-options');
+        const themeSwitchLightBtn = shadow.querySelector('#theme-switch-light');
+        const themeSwitchDarkBtn = shadow.querySelector('#theme-switch-dark');
+        const roleSwitchBotBtn = shadow.querySelector('#role-switch-bot');
+        const roleSwitchUserBtn = shadow.querySelector('#role-switch-user');
         const customAiBgInput = shadow.querySelector('#custom-ai-bg');
         const customUserBgInput = shadow.querySelector('#custom-user-bg');
+        const botMessageBgRow = shadow.querySelector('#bot-message-bg-row');
+        const userMessageBgRow = shadow.querySelector('#user-message-bg-row');
         const smallProfileImagesCheckbox = shadow.querySelector('#small-profile-images-checkbox');
         const roundedProfileImagesCheckbox = shadow.querySelector('#rounded-profile-images-checkbox');
         const swapCheckboxPositionCheckbox = shadow.querySelector('#swap-checkbox-position-checkbox');
@@ -10878,6 +11300,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const pageJumpCheckbox = shadow.querySelector('#pagejump-checkbox');
         const showStatsCheckbox = shadow.querySelector('#showstats-checkbox');
         const modelDetailsCheckbox = shadow.querySelector('#generation-model-details-checkbox');
+        const compactStatsCheckbox = shadow.querySelector('#compact-stats-checkbox');
         const showTimestampCheckbox = shadow.querySelector('#showtimestamp-checkbox');
         const timestampFormatCheckbox = shadow.querySelector('#timestamp-format-checkbox');
         const timestampHourFormatCheckbox = shadow.querySelector('#timestamp-hour-format-checkbox');
@@ -10897,6 +11320,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const enableGenerationProfilesCheckbox = shadow.querySelector('#generation-profiles-checkbox');
         const generationProfilesRow = shadow.querySelector('#generation-profiles-row');
         const modelDetailsRow = shadow.querySelector('#generation-model-details-row');
+        const compactStatsRow = shadow.querySelector('#compact-stats-row');
         const timestampFormatRow = shadow.querySelector('#timestamp-format-row');
         const timestampHourFormatRow = shadow.querySelector('#timestamp-hour-format-row');
         const compactGenerationRow = shadow.querySelector('#compact-generation-row');
@@ -10958,7 +11382,19 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const previewHoverButton = shadow.querySelector('#preview-hover-button');
         const previewCreatorLinkColor = shadow.querySelector('#preview-creator-link-color');
         const versionText = shadow.querySelector('#version-text');
+        const viewWhatsNewBtn = shadow.querySelector('#view-whats-new-btn');
         const debugFiltersSection = shadow.querySelector('#debug-filters-section');
+
+        // Keep the displayed version in sync with the actual installed version
+        // instead of a hardcoded string that goes stale after every release.
+        if (versionText) {
+            const _api = typeof browser !== 'undefined' ? browser : chrome;
+            versionText.textContent = 'v' + _api.runtime.getManifest().version;
+        }
+
+        if (viewWhatsNewBtn) {
+            viewWhatsNewBtn.addEventListener('click', () => showChangelogHistoryModal());
+        }
         
         // Debug filter checkboxes
         const debugFilterCheckboxes = {
@@ -11210,29 +11646,23 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         roundedProfileImagesCheckbox.checked = roundedProfileImagesEnabled;
         swapCheckboxPositionCheckbox.checked = swapCheckboxPositionEnabled;
         squareMessageEdgesCheckbox.checked = squareMessageEdgesEnabled;
-        customAiBgInput.value = customStyleValues.aiMessageBg;
-        customUserBgInput.value = customStyleValues.userMessageBg;
-        customBodyColorInput.value = customStyleValues.bodyColor;
+        // Color fields are populated per the current editingStyleProfile by
+        // applyStyleProfileToFields() below, once the preview elements it also
+        // updates have been declared. Shared (non-color) fields are set here.
         customBodyFontWeightSelect.value = customStyleValues.bodyFontWeight || 'normal';
         customBodyFontStyleSelect.value = customStyleValues.bodyFontStyle || 'normal';
         customBodyTextDecorationSelect.value = customStyleValues.bodyTextDecoration || 'none';
-        customSpanQuoteColorInput.value = customStyleValues.spanQuoteColor;
         customQuoteFontWeightSelect.value = customStyleValues.spanQuoteFontWeight || 'normal';
         customQuoteFontStyleSelect.value = customStyleValues.spanQuoteFontStyle || 'normal';
         customQuoteTextDecorationSelect.value = customStyleValues.spanQuoteTextDecoration || 'none';
-        customNarrationColorInput.value = customStyleValues.narrationColor;
         customNarrationFontWeightSelect.value = customStyleValues.narrationFontWeight || 'normal';
         customNarrationFontStyleSelect.value = customStyleValues.narrationFontStyle || 'italic';
         customNarrationTextDecorationSelect.value = customStyleValues.narrationTextDecoration || 'none';
-        customHighlightBgColorInput.value = customStyleValues.highlightBgColor;
-        customHighlightTextColorInput.value = customStyleValues.highlightTextColor;
         customHighlightFontWeightSelect.value = customStyleValues.highlightFontWeight || 'normal';
         customHighlightFontStyleSelect.value = customStyleValues.highlightFontStyle || 'normal';
         customHighlightTextDecorationSelect.value = customStyleValues.highlightTextDecoration || 'none';
         customFontSizeInput.value = customStyleValues.fontSize;
         customFontFamilyInput.value = customStyleValues.fontFamily || '';
-        customHoverButtonColorInput.value = customStyleValues.hoverButtonColor || '#292929';
-        customCreatorLinkColorInput.value = customStyleValues.creatorLinkColor || '';
         messageContainerMaxWidthInput.value = messageContainerMaxWidth || '';
         // Initialize preview display with current value (normalized)
         try {
@@ -11255,6 +11685,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         pageJumpCheckbox.checked = pageJumpEnabled;
         showStatsCheckbox.checked = showStatsEnabled;
         modelDetailsCheckbox.checked = showModelDetailsEnabled;
+        compactStatsCheckbox.checked = compactStatsEnabled;
         showTimestampCheckbox.checked = showTimestampEnabled;
         highlightModelChangesCheckbox.checked = highlightModelChangesEnabled;
         autoRegenMismatchCheckbox.checked = autoRegenOnMismatchEnabled;
@@ -11297,8 +11728,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         // Show/hide model details row based on showStats setting
         if (showStatsEnabled) {
             modelDetailsRow.classList.remove('hidden');
+            compactStatsRow.classList.remove('hidden');
         } else {
             modelDetailsRow.classList.add('hidden');
+            compactStatsRow.classList.add('hidden');
         }
         
         // Show/hide timestamp format rows based on showTimestamp setting
@@ -11584,91 +12017,180 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         const previewTextNarration = shadow.querySelector('#preview-text-narration');
         const previewTextHighlight = shadow.querySelector('#preview-text-highlight');
         
-        // Function to update font preview
+        const fontPreviewBox = shadow.querySelector('#font-preview-box');
+        const fontPreviewPage = shadow.querySelector('#font-preview-page');
+
+        // Function to update font preview. Body/Dialogue/Narration colors
+        // come from whichever profile AND role are currently being edited;
+        // Highlight colors are flat (no bot/user split); typography fields
+        // are shared.
         const updateFontPreview = () => {
+            const c = customStyleValues[editingStyleProfile];
+            const r = c[editingStyleRole];
+            if (fontPreviewPage) {
+                // The outer page backdrop SpicyChat itself would show behind
+                // the bubble — the bubble color below composites over this,
+                // same as it does on the real site.
+                fontPreviewPage.style.background = editingStyleProfile === 'light' ? '#ffffff' : '#1a1a1a';
+            }
+            if (fontPreviewBox) {
+                // Preview against the ACTUAL configured bubble background for
+                // whichever role is being edited (aiMessageBg vs
+                // userMessageBg) — not just a flat light/dark guess — so text
+                // colors tuned for the user's always-dark bubble don't look
+                // broken here just because the page theme is Light.
+                const bubbleBg = editingStyleRole === 'user' ? c.userMessageBg : c.aiMessageBg;
+                fontPreviewBox.style.background = bubbleBg || (editingStyleProfile === 'light' ? '#ffffff' : '#1a1a1a');
+                fontPreviewBox.style.borderColor = editingStyleProfile === 'light' ? '#d1d5db' : '#555';
+            }
             if (fontPreviewText) {
                 fontPreviewText.style.fontSize = customStyleValues.fontSize || '16px';
                 fontPreviewText.style.fontFamily = customStyleValues.fontFamily || 'inherit';
                 fontPreviewText.style.fontWeight = customStyleValues.bodyFontWeight || 'normal';
                 fontPreviewText.style.fontStyle = customStyleValues.bodyFontStyle || 'normal';
                 fontPreviewText.style.textDecoration = customStyleValues.bodyTextDecoration || 'none';
-                fontPreviewText.style.color = customStyleValues.bodyColor || '#fff';
+                fontPreviewText.style.color = r.bodyColor || '#fff';
             }
             if (previewTextQuote) {
-                previewTextQuote.style.color = customStyleValues.spanQuoteColor || '#fff';
+                previewTextQuote.style.color = r.spanQuoteColor || '#fff';
                 previewTextQuote.style.fontWeight = customStyleValues.spanQuoteFontWeight || 'normal';
                 previewTextQuote.style.fontStyle = customStyleValues.spanQuoteFontStyle || 'normal';
                 previewTextQuote.style.textDecoration = customStyleValues.spanQuoteTextDecoration || 'none';
             }
             if (previewTextNarration) {
-                previewTextNarration.style.color = customStyleValues.narrationColor || '#06B7DB';
+                previewTextNarration.style.color = r.narrationColor || '#06B7DB';
                 previewTextNarration.style.fontFamily = customStyleValues.fontFamily || 'inherit';
                 previewTextNarration.style.fontWeight = customStyleValues.narrationFontWeight || 'normal';
                 previewTextNarration.style.fontStyle = customStyleValues.narrationFontStyle || 'italic';
                 previewTextNarration.style.textDecoration = customStyleValues.narrationTextDecoration || 'none';
             }
             if (previewTextHighlight) {
-                previewTextHighlight.style.backgroundColor = customStyleValues.highlightBgColor || '#ffdd6d';
-                previewTextHighlight.style.color = customStyleValues.highlightTextColor || '#000';
+                previewTextHighlight.style.backgroundColor = c.highlightBgColor || '#ffdd6d';
+                previewTextHighlight.style.color = c.highlightTextColor || '#000';
                 previewTextHighlight.style.fontWeight = customStyleValues.highlightFontWeight || 'normal';
                 previewTextHighlight.style.fontStyle = customStyleValues.highlightFontStyle || 'normal';
                 previewTextHighlight.style.textDecoration = customStyleValues.highlightTextDecoration || 'none';
             }
         };
-        
-        // Initialize color previews
-        if (previewAiBg) previewAiBg.style.background = customStyleValues.aiMessageBg || 'transparent';
-        if (previewUserBg) previewUserBg.style.background = customStyleValues.userMessageBg || 'transparent';
-        if (previewBodyColor) previewBodyColor.style.background = customStyleValues.bodyColor || 'transparent';
-        if (previewQuoteColor) previewQuoteColor.style.background = customStyleValues.spanQuoteColor || 'transparent';
-        if (previewNarrationColor) previewNarrationColor.style.background = customStyleValues.narrationColor || 'transparent';
-        if (previewHighlightBg) previewHighlightBg.style.background = customStyleValues.highlightBgColor || 'transparent';
-        if (previewHighlightText) previewHighlightText.style.background = customStyleValues.highlightTextColor || 'transparent';
-        if (previewHoverButton) previewHoverButton.style.background = customStyleValues.hoverButtonColor || '#292929';
-        if (previewCreatorLinkColor) previewCreatorLinkColor.style.background = customStyleValues.creatorLinkColor || 'transparent';
+
+        // Populates every color input/swatch (and both switches' active
+        // state) from customStyleValues[editingStyleProfile][editingStyleRole]
+        // (Body/Dialogue/Narration) or customStyleValues[editingStyleProfile]
+        // directly (everything else). Called on initial load, whenever
+        // either switch is toggled, and after import/reset.
+        const applyStyleProfileToFields = () => {
+            const c = customStyleValues[editingStyleProfile];
+            const r = c[editingStyleRole];
+            if (themeSwitchLightBtn) themeSwitchLightBtn.classList.toggle('active', editingStyleProfile === 'light');
+            if (themeSwitchDarkBtn) themeSwitchDarkBtn.classList.toggle('active', editingStyleProfile === 'dark');
+            if (roleSwitchBotBtn) roleSwitchBotBtn.classList.toggle('active', editingStyleRole === 'bot');
+            if (roleSwitchUserBtn) roleSwitchUserBtn.classList.toggle('active', editingStyleRole === 'user');
+            if (botMessageBgRow) botMessageBgRow.classList.toggle('hidden', editingStyleRole !== 'bot');
+            if (userMessageBgRow) userMessageBgRow.classList.toggle('hidden', editingStyleRole !== 'user');
+
+            customAiBgInput.value = c.aiMessageBg;
+            customUserBgInput.value = c.userMessageBg;
+            customBodyColorInput.value = r.bodyColor;
+            customSpanQuoteColorInput.value = r.spanQuoteColor;
+            customNarrationColorInput.value = r.narrationColor;
+            customHighlightBgColorInput.value = c.highlightBgColor;
+            customHighlightTextColorInput.value = c.highlightTextColor;
+            customHoverButtonColorInput.value = c.hoverButtonColor || '#292929';
+            customCreatorLinkColorInput.value = c.creatorLinkColor || '';
+
+            if (previewAiBg) previewAiBg.style.background = c.aiMessageBg || 'transparent';
+            if (previewUserBg) previewUserBg.style.background = c.userMessageBg || 'transparent';
+            if (previewBodyColor) previewBodyColor.style.background = r.bodyColor || 'transparent';
+            if (previewQuoteColor) previewQuoteColor.style.background = r.spanQuoteColor || 'transparent';
+            if (previewNarrationColor) previewNarrationColor.style.background = r.narrationColor || 'transparent';
+            if (previewHighlightBg) previewHighlightBg.style.background = c.highlightBgColor || 'transparent';
+            if (previewHighlightText) previewHighlightText.style.background = c.highlightTextColor || 'transparent';
+            if (previewHoverButton) previewHoverButton.style.background = c.hoverButtonColor || '#292929';
+            if (previewCreatorLinkColor) previewCreatorLinkColor.style.background = c.creatorLinkColor || 'transparent';
+
+            updateFontPreview();
+        };
+
         if (previewMemoryDotColor) previewMemoryDotColor.style.background = memoryDotColor || '#ff3b3b';
-        updateFontPreview();
-        
+        applyStyleProfileToFields();
+
+        // Light/Dark switch — flips which profile the fields/previews below
+        // are bound to. Doesn't touch the other profile's stored values.
+        if (themeSwitchLightBtn) {
+            themeSwitchLightBtn.onclick = (e) => {
+                e.stopPropagation();
+                editingStyleProfile = 'light';
+                applyStyleProfileToFields();
+            };
+        }
+        if (themeSwitchDarkBtn) {
+            themeSwitchDarkBtn.onclick = (e) => {
+                e.stopPropagation();
+                editingStyleProfile = 'dark';
+                applyStyleProfileToFields();
+            };
+        }
+
+        // Bot/User switch — flips which role's Body/Dialogue/Narration
+        // colors the fields/previews below are bound to. Independent of the
+        // Light/Dark switch above; doesn't touch the other role's values.
+        if (roleSwitchBotBtn) {
+            roleSwitchBotBtn.onclick = (e) => {
+                e.stopPropagation();
+                editingStyleRole = 'bot';
+                applyStyleProfileToFields();
+            };
+        }
+        if (roleSwitchUserBtn) {
+            roleSwitchUserBtn.onclick = (e) => {
+                e.stopPropagation();
+                editingStyleRole = 'user';
+                applyStyleProfileToFields();
+            };
+        }
+
         // Update custom style values when inputs change (with preview updates)
-        customAiBgInput.oninput = (e) => { 
-            customStyleValues.aiMessageBg = e.target.value;
+        customAiBgInput.oninput = (e) => {
+            customStyleValues[editingStyleProfile].aiMessageBg = e.target.value;
             if (previewAiBg) previewAiBg.style.background = e.target.value || 'transparent';
+            updateFontPreview();
         };
-        customUserBgInput.oninput = (e) => { 
-            customStyleValues.userMessageBg = e.target.value;
+        customUserBgInput.oninput = (e) => {
+            customStyleValues[editingStyleProfile].userMessageBg = e.target.value;
             if (previewUserBg) previewUserBg.style.background = e.target.value || 'transparent';
+            updateFontPreview();
         };
-        customBodyColorInput.oninput = (e) => { 
-            customStyleValues.bodyColor = e.target.value;
+        customBodyColorInput.oninput = (e) => {
+            customStyleValues[editingStyleProfile][editingStyleRole].bodyColor = e.target.value;
             if (previewBodyColor) previewBodyColor.style.background = e.target.value || 'transparent';
             updateFontPreview();
         };
         customBodyFontWeightSelect.onchange = (e) => { customStyleValues.bodyFontWeight = e.target.value; updateFontPreview(); };
         customBodyFontStyleSelect.onchange = (e) => { customStyleValues.bodyFontStyle = e.target.value; updateFontPreview(); };
         customBodyTextDecorationSelect.onchange = (e) => { customStyleValues.bodyTextDecoration = e.target.value; updateFontPreview(); };
-        customSpanQuoteColorInput.oninput = (e) => { 
-            customStyleValues.spanQuoteColor = e.target.value;
+        customSpanQuoteColorInput.oninput = (e) => {
+            customStyleValues[editingStyleProfile][editingStyleRole].spanQuoteColor = e.target.value;
             if (previewQuoteColor) previewQuoteColor.style.background = e.target.value || 'transparent';
             updateFontPreview();
         };
         customQuoteFontWeightSelect.onchange = (e) => { customStyleValues.spanQuoteFontWeight = e.target.value; updateFontPreview(); };
         customQuoteFontStyleSelect.onchange = (e) => { customStyleValues.spanQuoteFontStyle = e.target.value; updateFontPreview(); };
         customQuoteTextDecorationSelect.onchange = (e) => { customStyleValues.spanQuoteTextDecoration = e.target.value; updateFontPreview(); };
-        customNarrationColorInput.oninput = (e) => { 
-            customStyleValues.narrationColor = e.target.value;
+        customNarrationColorInput.oninput = (e) => {
+            customStyleValues[editingStyleProfile][editingStyleRole].narrationColor = e.target.value;
             if (previewNarrationColor) previewNarrationColor.style.background = e.target.value || 'transparent';
             updateFontPreview();
         };
         customNarrationFontWeightSelect.onchange = (e) => { customStyleValues.narrationFontWeight = e.target.value; updateFontPreview(); };
         customNarrationFontStyleSelect.onchange = (e) => { customStyleValues.narrationFontStyle = e.target.value; updateFontPreview(); };
         customNarrationTextDecorationSelect.onchange = (e) => { customStyleValues.narrationTextDecoration = e.target.value; updateFontPreview(); };
-        customHighlightBgColorInput.oninput = (e) => { 
-            customStyleValues.highlightBgColor = e.target.value;
+        customHighlightBgColorInput.oninput = (e) => {
+            customStyleValues[editingStyleProfile].highlightBgColor = e.target.value;
             if (previewHighlightBg) previewHighlightBg.style.background = e.target.value || 'transparent';
             updateFontPreview();
         };
-        customHighlightTextColorInput.oninput = (e) => { 
-            customStyleValues.highlightTextColor = e.target.value;
+        customHighlightTextColorInput.oninput = (e) => {
+            customStyleValues[editingStyleProfile].highlightTextColor = e.target.value;
             if (previewHighlightText) previewHighlightText.style.background = e.target.value || 'transparent';
             updateFontPreview();
         };
@@ -11678,11 +12200,11 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         customFontSizeInput.oninput = (e) => { customStyleValues.fontSize = e.target.value; updateFontPreview(); };
         customFontFamilyInput.oninput = (e) => { customStyleValues.fontFamily = e.target.value; updateFontPreview(); };
         customHoverButtonColorInput.oninput = (e) => {
-            customStyleValues.hoverButtonColor = e.target.value;
+            customStyleValues[editingStyleProfile].hoverButtonColor = e.target.value;
             if (previewHoverButton) previewHoverButton.style.background = e.target.value || 'transparent';
         };
         customCreatorLinkColorInput.oninput = (e) => {
-            customStyleValues.creatorLinkColor = e.target.value;
+            customStyleValues[editingStyleProfile].creatorLinkColor = e.target.value;
             if (previewCreatorLinkColor) previewCreatorLinkColor.style.background = e.target.value || 'transparent';
         };
 
@@ -11836,15 +12358,23 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             // Toggle model details sub-checkbox visibility
             if (showStatsEnabled) {
                 modelDetailsRow.classList.remove('hidden');
+                compactStatsRow.classList.remove('hidden');
             } else {
                 modelDetailsRow.classList.add('hidden');
+                compactStatsRow.classList.add('hidden');
             }
         };
-        
+
         modelDetailsCheckbox.onchange = (e) => {
             debugLog('[Core] MODEL DETAILS CHECKBOX CHANGED');
             showModelDetailsEnabled = e.target.checked;
             debugLog('[Core] Show Model Details:', showModelDetailsEnabled);
+        };
+
+        compactStatsCheckbox.onchange = (e) => {
+            debugLog('[Core] COMPACT STATS CHECKBOX CHANGED');
+            compactStatsEnabled = e.target.checked;
+            debugLog('[Core] Compact Stats:', compactStatsEnabled);
         };
         
         showTimestampCheckbox.onchange = (e) => {
@@ -12099,6 +12629,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             // it closes only when the last in-flight call finishes.
             let _driveKeepalivePort = null;
             let _driveKeepaliveRefs = 0;
+            let _driveHeartbeatTimer = null;
             const acquireDriveKeepalive = () => {
                 _driveKeepaliveRefs++;
                 if (!_driveKeepalivePort) {
@@ -12107,12 +12638,33 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         _driveKeepalivePort.onDisconnect.addListener(() => { _driveKeepalivePort = null; });
                     } catch (_) { _driveKeepalivePort = null; }
                 }
+                // Active heartbeat — the load-bearing keepalive on Orion/iOS. An OPEN port (above) is
+                // a Chrome idle-timer mechanism and does NOT stop iOS from OS-suspending the background
+                // during a message-silent window (the IndexedDB merge), which freezes its event loop
+                // and ALL its watchdog timers — the "Merging data…" stall that only the 60s timer can't
+                // break because the timer is frozen too. This content script stays alive in the
+                // foreground; a message every ~1s delivers a wake event that keeps the background
+                // scheduled so the merge runs to completion. Errors (bg briefly between wakes) are
+                // ignored — the next tick retries.
+                if (!_driveHeartbeatTimer) {
+                    _driveHeartbeatTimer = setInterval(() => {
+                        try {
+                            runtimeAPI.runtime.sendMessage({ type: 'SAI_KEEPALIVE_PING' }, () => { void runtimeAPI.runtime.lastError; });
+                        } catch (_) {}
+                    }, 500);
+                }
             };
             const releaseDriveKeepalive = () => {
                 _driveKeepaliveRefs = Math.max(0, _driveKeepaliveRefs - 1);
-                if (_driveKeepaliveRefs === 0 && _driveKeepalivePort) {
-                    try { _driveKeepalivePort.disconnect(); } catch (_) {}
-                    _driveKeepalivePort = null;
+                if (_driveKeepaliveRefs === 0) {
+                    if (_driveKeepalivePort) {
+                        try { _driveKeepalivePort.disconnect(); } catch (_) {}
+                        _driveKeepalivePort = null;
+                    }
+                    if (_driveHeartbeatTimer) {
+                        clearInterval(_driveHeartbeatTimer);
+                        _driveHeartbeatTimer = null;
+                    }
                 }
             };
 
@@ -12308,7 +12860,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 if (imported.enableClassicLayout !== undefined) updates.enableClassicLayout = imported.enableClassicLayout;
                 if (imported.enableClassicStyle !== undefined) updates.enableClassicStyle = imported.enableClassicStyle;
                 if (imported.enableCustomStyle !== undefined) updates.enableCustomStyle = imported.enableCustomStyle;
-                if (imported.customStyleValues !== undefined) updates.customStyleValues = imported.customStyleValues;
+                if (imported.customStyleValues !== undefined) updates.customStyleValues = JSON.stringify(normalizeCustomStyleValues(imported.customStyleValues));
                 if (imported.enableThemeCustomization !== undefined && imported.enableClassicLayout === undefined && imported.enableClassicStyle === undefined) {
                     updates.enableClassicLayout = imported.enableThemeCustomization;
                     updates.enableClassicStyle = imported.enableThemeCustomization;
@@ -12318,6 +12870,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 if (imported.enablePageJump !== undefined) updates.enablePageJump = imported.enablePageJump;
                 if (imported.showGenerationStats !== undefined) updates.showGenerationStats = imported.showGenerationStats;
                 if (imported.showModelDetails !== undefined) updates.showModelDetails = imported.showModelDetails;
+                if (imported.compactStats !== undefined) updates.compactStats = imported.compactStats;
                 if (imported.showTimestamp !== undefined) updates.showTimestamp = imported.showTimestamp;
                 if (imported.timestampDateFirst !== undefined) updates.timestampDateFirst = imported.timestampDateFirst;
                 if (imported.timestamp24Hour !== undefined) updates.timestamp24Hour = imported.timestamp24Hour;
@@ -12664,6 +13217,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             pageJumpEnabled = pageJumpCheckbox.checked;
             showStatsEnabled = showStatsCheckbox.checked;
             showModelDetailsEnabled = modelDetailsCheckbox.checked;
+            compactStatsEnabled = compactStatsCheckbox.checked;
             showTimestampEnabled = showTimestampCheckbox.checked;
             timestampDateFirst = timestampFormatCheckbox.checked;
             timestamp24Hour = timestampHourFormatCheckbox.checked;
@@ -12701,6 +13255,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             await storage.set(PAGE_JUMP_KEY, pageJumpEnabled);
             await storage.set('showGenerationStats', showStatsEnabled);
             await storage.set('showModelDetails', showModelDetailsEnabled);
+            await storage.set('compactStats', compactStatsEnabled);
             await storage.set('showTimestamp', showTimestampEnabled);
             await storage.set('timestampDateFirst', timestampDateFirst);
             await storage.set('timestamp24Hour', timestamp24Hour);
@@ -12722,6 +13277,16 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             await storage.set(MESSAGE_CONTAINER_MAX_WIDTH_KEY, messageContainerMaxWidth);
             await storage.set(MEMORY_DOT_ENABLED_KEY, memoryDotEnabled);
             await storage.set(MEMORY_DOT_COLOR_KEY, memoryDotColor);
+            // Debug log filters — Save-time fallback. The per-checkbox change/click handlers are
+            // unreliable on WebKit/Orion (shadow-DOM checkboxes), so reconcile straight from the
+            // DOM here, exactly like every other setting above. Without this, the in-memory
+            // filters and storage stay at defaults while the UI shows the user's selection — so
+            // disabled categories keep logging. The storage.onChanged listener (top of file)
+            // mirrors this back into the live debugLog() filter immediately.
+            for (const [category, checkbox] of Object.entries(debugFilterCheckboxes)) {
+                if (checkbox) debugLogFilters[category] = checkbox.checked;
+            }
+            await storage.set('debugLogFilters', debugLogFilters);
             // Mark onboarding as seen when user saves settings
             await storage.set('hasSeenOnboarding', true);
             debugLog('[Core] Settings saved to storage');
@@ -12817,7 +13382,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 e.stopPropagation();
                 try {
                     const customStyleValuesJson = await storage.get(CUSTOM_STYLE_VALUES_KEY, JSON.stringify(DEFAULT_CUSTOM_STYLE));
-                    const customStyleValues = JSON.parse(customStyleValuesJson);
+                    const customStyleValues = normalizeCustomStyleValues(customStyleValuesJson);
                     const dataStr = JSON.stringify(customStyleValues, null, 2);
                     const dataBlob = new Blob([dataStr], { type: 'application/json' });
                     const url = URL.createObjectURL(dataBlob);
@@ -12878,62 +13443,37 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                                 delete imported.italicColor;
                                 delete imported.quoteColor;
 
-                                // Merge with defaults to ensure all fields exist
-                                const mergedValues = { ...DEFAULT_CUSTOM_STYLE, ...imported };
+                                // normalizeCustomStyleValues() handles both the legacy flat
+                                // shape (pre-dual-theme exports) and the current
+                                // { light, dark, ...shared } shape, filling any gaps from
+                                // defaults — so an old export still imports cleanly.
+                                const mergedValues = normalizeCustomStyleValues(imported);
                                 // Update the in-memory values
                                 Object.assign(customStyleValues, mergedValues);
 
-                                // Update the UI inputs - colors
-                                customAiBgInput.value = customStyleValues.aiMessageBg;
-                                customUserBgInput.value = customStyleValues.userMessageBg;
-                                customBodyColorInput.value = customStyleValues.bodyColor;
-                                customSpanQuoteColorInput.value = customStyleValues.spanQuoteColor;
-                                customNarrationColorInput.value = customStyleValues.narrationColor;
-                                customHighlightBgColorInput.value = customStyleValues.highlightBgColor;
-                                customHighlightTextColorInput.value = customStyleValues.highlightTextColor;
-                                customHoverButtonColorInput.value = customStyleValues.hoverButtonColor || '#292929';
-                                customCreatorLinkColorInput.value = customStyleValues.creatorLinkColor || '';
+                                // Font family/size (shared, not theme-split)
+                                customFontSizeInput.value = customStyleValues.fontSize;
+                                customFontFamilyInput.value = customStyleValues.fontFamily || '';
 
-                                // Body text styling
+                                // Body/quote/narration/highlight typography (shared)
                                 customBodyFontWeightSelect.value = customStyleValues.bodyFontWeight || 'normal';
                                 customBodyFontStyleSelect.value = customStyleValues.bodyFontStyle || 'normal';
                                 customBodyTextDecorationSelect.value = customStyleValues.bodyTextDecoration || 'none';
-
-                                // Span/quote text styling
                                 customQuoteFontWeightSelect.value = customStyleValues.spanQuoteFontWeight || 'normal';
                                 customQuoteFontStyleSelect.value = customStyleValues.spanQuoteFontStyle || 'normal';
                                 customQuoteTextDecorationSelect.value = customStyleValues.spanQuoteTextDecoration || 'none';
-
-                                // Narration text styling
                                 customNarrationFontWeightSelect.value = customStyleValues.narrationFontWeight || 'normal';
                                 customNarrationFontStyleSelect.value = customStyleValues.narrationFontStyle || 'italic';
                                 customNarrationTextDecorationSelect.value = customStyleValues.narrationTextDecoration || 'none';
-
-                                // Highlight text styling
                                 customHighlightFontWeightSelect.value = customStyleValues.highlightFontWeight || 'normal';
                                 customHighlightFontStyleSelect.value = customStyleValues.highlightFontStyle || 'normal';
                                 customHighlightTextDecorationSelect.value = customStyleValues.highlightTextDecoration || 'none';
 
-                                // Font family/size
-                                customFontSizeInput.value = customStyleValues.fontSize;
-                                customFontFamilyInput.value = customStyleValues.fontFamily || '';
-
                                 // Reset background image file picker (actual data lives in customStyleValues.backgroundImage)
                                 if (customBackgroundImageInput) customBackgroundImageInput.value = '';
 
-                                // Update preview swatches
-                                if (previewAiBg) previewAiBg.style.background = customStyleValues.aiMessageBg || 'transparent';
-                                if (previewUserBg) previewUserBg.style.background = customStyleValues.userMessageBg || 'transparent';
-                                if (previewBodyColor) previewBodyColor.style.background = customStyleValues.bodyColor || 'transparent';
-                                if (previewQuoteColor) previewQuoteColor.style.background = customStyleValues.spanQuoteColor || 'transparent';
-                                if (previewNarrationColor) previewNarrationColor.style.background = customStyleValues.narrationColor || 'transparent';
-                                if (previewHighlightBg) previewHighlightBg.style.background = customStyleValues.highlightBgColor || 'transparent';
-                                if (previewHighlightText) previewHighlightText.style.background = customStyleValues.highlightTextColor || 'transparent';
-                                if (previewHoverButton) previewHoverButton.style.background = customStyleValues.hoverButtonColor || '#292929';
-                                if (previewCreatorLinkColor) previewCreatorLinkColor.style.background = customStyleValues.creatorLinkColor || 'transparent';
-
-                                // Refresh the live font preview block
-                                updateFontPreview();
+                                // Colors, swatches, and font preview for the currently-viewed profile
+                                applyStyleProfileToFields();
 
                                 showNotification('Custom Style imported - click Save to apply');
                             } catch (err) {
@@ -12947,55 +13487,41 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             };
         }
 
-        // Reset Custom Style to Defaults button
+        // Reset Custom Style to Defaults button — resets only the profile
+        // currently being viewed (plus the shared typography fields); the
+        // other profile's colors are left untouched.
         if (resetCustomStyleBtn) {
             resetCustomStyleBtn.onclick = async (e) => {
                 e.stopPropagation();
 
-                // Reset all values to defaults
-                Object.assign(customStyleValues, DEFAULT_CUSTOM_STYLE);
+                customStyleValues[editingStyleProfile] = {
+                    ...DEFAULT_CUSTOM_STYLE[editingStyleProfile],
+                    bot: { ...DEFAULT_CUSTOM_STYLE[editingStyleProfile].bot },
+                    user: { ...DEFAULT_CUSTOM_STYLE[editingStyleProfile].user }
+                };
+                Object.keys(DEFAULT_CUSTOM_STYLE).forEach((key) => {
+                    if (key !== 'light' && key !== 'dark') customStyleValues[key] = DEFAULT_CUSTOM_STYLE[key];
+                });
 
-                // Update all UI inputs with default values
-                customAiBgInput.value = DEFAULT_CUSTOM_STYLE.aiMessageBg;
-                customUserBgInput.value = DEFAULT_CUSTOM_STYLE.userMessageBg;
-                customBodyColorInput.value = DEFAULT_CUSTOM_STYLE.bodyColor;
+                customFontSizeInput.value = DEFAULT_CUSTOM_STYLE.fontSize;
+                customFontFamilyInput.value = DEFAULT_CUSTOM_STYLE.fontFamily;
                 customBodyFontWeightSelect.value = DEFAULT_CUSTOM_STYLE.bodyFontWeight;
                 customBodyFontStyleSelect.value = DEFAULT_CUSTOM_STYLE.bodyFontStyle;
                 customBodyTextDecorationSelect.value = DEFAULT_CUSTOM_STYLE.bodyTextDecoration;
-                customSpanQuoteColorInput.value = DEFAULT_CUSTOM_STYLE.spanQuoteColor;
                 customQuoteFontWeightSelect.value = DEFAULT_CUSTOM_STYLE.spanQuoteFontWeight;
                 customQuoteFontStyleSelect.value = DEFAULT_CUSTOM_STYLE.spanQuoteFontStyle;
                 customQuoteTextDecorationSelect.value = DEFAULT_CUSTOM_STYLE.spanQuoteTextDecoration;
-                customNarrationColorInput.value = DEFAULT_CUSTOM_STYLE.narrationColor;
                 customNarrationFontWeightSelect.value = DEFAULT_CUSTOM_STYLE.narrationFontWeight;
                 customNarrationFontStyleSelect.value = DEFAULT_CUSTOM_STYLE.narrationFontStyle;
                 customNarrationTextDecorationSelect.value = DEFAULT_CUSTOM_STYLE.narrationTextDecoration;
-                customHighlightBgColorInput.value = DEFAULT_CUSTOM_STYLE.highlightBgColor;
-                customHighlightTextColorInput.value = DEFAULT_CUSTOM_STYLE.highlightTextColor;
                 customHighlightFontWeightSelect.value = DEFAULT_CUSTOM_STYLE.highlightFontWeight;
                 customHighlightFontStyleSelect.value = DEFAULT_CUSTOM_STYLE.highlightFontStyle;
                 customHighlightTextDecorationSelect.value = DEFAULT_CUSTOM_STYLE.highlightTextDecoration;
-                customFontSizeInput.value = DEFAULT_CUSTOM_STYLE.fontSize;
-                customFontFamilyInput.value = DEFAULT_CUSTOM_STYLE.fontFamily;
-                customHoverButtonColorInput.value = DEFAULT_CUSTOM_STYLE.hoverButtonColor;
-                customCreatorLinkColorInput.value = DEFAULT_CUSTOM_STYLE.creatorLinkColor;
                 customBackgroundImageInput.value = '';
 
-                // Update preview elements
-                if (previewAiBg) previewAiBg.style.background = DEFAULT_CUSTOM_STYLE.aiMessageBg;
-                if (previewUserBg) previewUserBg.style.background = DEFAULT_CUSTOM_STYLE.userMessageBg;
-                if (previewBodyColor) previewBodyColor.style.background = DEFAULT_CUSTOM_STYLE.bodyColor;
-                if (previewQuoteColor) previewQuoteColor.style.background = DEFAULT_CUSTOM_STYLE.spanQuoteColor;
-                if (previewNarrationColor) previewNarrationColor.style.background = DEFAULT_CUSTOM_STYLE.narrationColor;
-                if (previewHighlightBg) previewHighlightBg.style.background = DEFAULT_CUSTOM_STYLE.highlightBgColor;
-                if (previewHighlightText) previewHighlightText.style.background = DEFAULT_CUSTOM_STYLE.highlightTextColor;
-                if (previewHoverButton) previewHoverButton.style.background = DEFAULT_CUSTOM_STYLE.hoverButtonColor;
-                if (previewCreatorLinkColor) previewCreatorLinkColor.style.background = DEFAULT_CUSTOM_STYLE.creatorLinkColor || 'transparent';
+                applyStyleProfileToFields();
 
-                // Update font preview
-                updateFontPreview();
-
-                showNotification('Custom Style reset to defaults - click Save to apply');
+                showNotification(`Custom Style (${editingStyleProfile}) reset to defaults - click Save to apply`);
             };
         }
 
@@ -13029,6 +13555,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         [PAGE_JUMP_KEY]: false,
                         'showGenerationStats': false,
                         'showModelDetails': true,
+                        'compactStats': false,
                         'showTimestamp': false,
                         'highlightModelChanges': false,
                         'autoRegenOnMismatch': false,
@@ -13082,6 +13609,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         enablePageJump: exportData[PAGE_JUMP_KEY],
                         showGenerationStats: exportData['showGenerationStats'],
                         showModelDetails: exportData['showModelDetails'],
+                        compactStats: exportData['compactStats'],
                         showTimestamp: exportData['showTimestamp'],
                         timestampDateFirst: exportData['timestampDateFirst'],
                         timestamp24Hour: exportData['timestamp24Hour'],
@@ -13244,7 +13772,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         if (imported.enableClassicLayout !== undefined) updates.enableClassicLayout = imported.enableClassicLayout;
                         if (imported.enableClassicStyle !== undefined) updates.enableClassicStyle = imported.enableClassicStyle;
                         if (imported.enableCustomStyle !== undefined) updates.enableCustomStyle = imported.enableCustomStyle;
-                        if (imported.customStyleValues !== undefined) updates.customStyleValues = imported.customStyleValues;
+                        if (imported.customStyleValues !== undefined) updates.customStyleValues = JSON.stringify(normalizeCustomStyleValues(imported.customStyleValues));
                         // Support legacy key for backwards compatibility
                         if (imported.enableThemeCustomization !== undefined && imported.enableClassicLayout === undefined && imported.enableClassicStyle === undefined) {
                             updates.enableClassicLayout = imported.enableThemeCustomization;
@@ -13255,6 +13783,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         if (imported.enablePageJump !== undefined) updates.enablePageJump = imported.enablePageJump;
                         if (imported.showGenerationStats !== undefined) updates.showGenerationStats = imported.showGenerationStats;
                         if (imported.showModelDetails !== undefined) updates.showModelDetails = imported.showModelDetails;
+                        if (imported.compactStats !== undefined) updates.compactStats = imported.compactStats;
                         if (imported.showTimestamp !== undefined) updates.showTimestamp = imported.showTimestamp;
                         if (imported.timestampDateFirst !== undefined) updates.timestampDateFirst = imported.timestampDateFirst;
                         if (imported.timestamp24Hour !== undefined) updates.timestamp24Hour = imported.timestamp24Hour;
@@ -13506,6 +14035,10 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     textarea._wysiwygMutationObserver.disconnect();
                     delete textarea._wysiwygMutationObserver;
                 }
+                if (textarea._wysiwygEditorMutationObserver) {
+                    textarea._wysiwygEditorMutationObserver.disconnect();
+                    delete textarea._wysiwygEditorMutationObserver;
+                }
                 if (textarea._wysiwygValueCheckInterval) {
                     clearInterval(textarea._wysiwygValueCheckInterval);
                     delete textarea._wysiwygValueCheckInterval;
@@ -13536,23 +14069,34 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     // Pre-emptive resize detection using mousedown on window edges
     // This removes elements BEFORE resize starts, avoiding React conflicts
     let resizeStartPending = false;
-    
+    // BUGFIX: any click within edgeThreshold of the viewport's right/bottom edge
+    // (a send button, a scrollbar, anything near the edge — not just an actual
+    // resize drag) sets isResizing=true below. If no real window 'resize' event
+    // follows, nothing else ever clears it — the 'mouseup' handler deliberately
+    // leaves that to the resize-end timer, which never gets scheduled. Once stuck,
+    // findAndSetupWysiwygTextareas() permanently skips rebuilding the WYSIWYG
+    // overlay for any new textarea (e.g. a new chat's composer), silently
+    // dropping syntax highlighting until the page is reloaded. This timer
+    // self-heals: if no genuine resize shows up shortly after the mousedown, we
+    // recover exactly as the real resize-end path would.
+    let mousedownResizeFallbackTimer = null;
+
     document.addEventListener('mousedown', function(e) {
         // Detect if mouse is near window edge (potential resize drag)
         const edgeThreshold = 10;
         const nearRightEdge = e.clientX >= window.innerWidth - edgeThreshold;
         const nearBottomEdge = e.clientY >= window.innerHeight - edgeThreshold;
-        
+
         if (nearRightEdge || nearBottomEdge) {
             debugLog('[Core] RESIZE START DETECTED (mousedown near edge)');
             resizeStartPending = true;
             isResizing = true;
             sidebarWidthTransitionPending = true;
             cancelAllPendingInjections();
-            
+
             // CRITICAL: Remove all WYSIWYG editors from DOM to prevent React 185 error
             removeAllWysiwygEditorsForResize();
-            
+
             // Remove button IMMEDIATELY before any resize events fire
             const sidebarBtn = document.getElementById('sai-toolkit-sidebar-btn');
             if (sidebarBtn) {
@@ -13564,6 +14108,21 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                     sidebarBtn.remove();
                 }
             }
+
+            // Self-healing fallback: if this wasn't actually a resize (no genuine
+            // 'resize' event follows), recover instead of staying stuck forever.
+            if (mousedownResizeFallbackTimer) clearTimeout(mousedownResizeFallbackTimer);
+            mousedownResizeFallbackTimer = setTimeout(function() {
+                if (!isResizing) return; // a real resize already took over cleanup
+                debugLog('[Core] RESIZE FALSE ALARM - no resize event followed edge mousedown, recovering');
+                isResizing = false;
+                sidebarWidthTransitionPending = false;
+                if (window.innerWidth >= 600) {
+                    injectToolkitSidebarButton();
+                }
+                debugLog('[WYSIWYG] Re-initializing editors after false-alarm resize recovery');
+                findAndSetupWysiwygTextareas();
+            }, RESIZE_DEBOUNCE_MS);
         }
     }, true); // Use capture phase to run before other handlers
     
@@ -13591,7 +14150,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         lastResizeWidth = width;
         debugLog('[Core] RESIZE EVENT - width:', width, 'wasResizing:', isResizing);
         lastResizeTime = Date.now();
-        
+
+        // A genuine resize is happening — the resize-end timer below now owns
+        // recovery, so cancel the mousedown false-alarm fallback to avoid a race.
+        if (mousedownResizeFallbackTimer) {
+            clearTimeout(mousedownResizeFallbackTimer);
+            mousedownResizeFallbackTimer = null;
+        }
+
         // If we didn't catch the resize start via mousedown, do removal now
         if (!isResizing) {
             isResizing = true;
@@ -14239,8 +14805,9 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         const statsEnabled = cache ? await cache.get('showGenerationStats', false) : await storage.get('showGenerationStats', false);
         const timestampEnabled = cache ? await cache.get('showTimestamp', false) : await storage.get('showTimestamp', false);
         const showModelDetails = cache ? await cache.get('showModelDetails', true) : await storage.get('showModelDetails', true);
+        const compactStats = cache ? await cache.get('compactStats', false) : await storage.get('compactStats', false);
         const showMessageIds = cache ? await cache.get(SHOW_MESSAGE_IDS_KEY, false) : await storage.get(SHOW_MESSAGE_IDS_KEY, false);
-        
+
         // Cache the highlight model changes setting globally for synchronous access
         window.__highlightModelChanges = cache ? await cache.get('highlightModelChanges', false) : await storage.get('highlightModelChanges', false);
         
@@ -14370,7 +14937,9 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
             
             if (hasSettings) {
                 displayLines.push(modelDisplay);
-                displayLines.push(`Tokens: ${fullStats.max_tokens} | Temp: ${fullStats.temperature.toFixed(2)} | Top P: ${fullStats.top_p} | Top K: ${fullStats.top_k}`);
+                displayLines.push(compactStats
+                    ? `${fullStats.max_tokens} | ${fullStats.temperature.toFixed(2)} | ${fullStats.top_p} | ${fullStats.top_k}`
+                    : `Tokens: ${fullStats.max_tokens} | Temp: ${fullStats.temperature.toFixed(2)} | Top P: ${fullStats.top_p} | Top K: ${fullStats.top_k}`);
             } else if (modelDisplay) {
                 displayLines.push(modelDisplay);
             }
@@ -14474,6 +15043,7 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         if (!statsEnabled && !timestampEnabled && !showMessageIds) return;
 
         const showModelDetails = cache ? await cache.get('showModelDetails', true) : await storage.get('showModelDetails', true);
+        const compactStats = cache ? await cache.get('compactStats', false) : await storage.get('compactStats', false);
 
         // Cache the highlight model changes setting globally for synchronous access
         window.__highlightModelChanges = cache ? await cache.get('highlightModelChanges', false) : await storage.get('highlightModelChanges', false);
@@ -14796,7 +15366,9 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                     }
 
                     displayLines.push(modelDisplay);
-                    displayLines.push(`Tokens: ${maxTokens} | Temp: ${temperature.toFixed(2)} | Top P: ${topP} | Top K: ${topK}`);
+                    displayLines.push(compactStats
+                        ? `${maxTokens} | ${temperature.toFixed(2)} | ${topP} | ${topK}`
+                        : `Tokens: ${maxTokens} | Temp: ${temperature.toFixed(2)} | Top P: ${topP} | Top K: ${topK}`);
                 }
                 
                 if (timestampEnabled && hasTimestamp) {
@@ -15289,9 +15861,10 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
             const statsEnabled = cache ? await cache.get('showGenerationStats', false) : await storage.get('showGenerationStats', false);
             const timestampEnabled = cache ? await cache.get('showTimestamp', false) : await storage.get('showTimestamp', false);
             const showModelDetails = cache ? await cache.get('showModelDetails', true) : await storage.get('showModelDetails', true);
+            const compactStats = cache ? await cache.get('compactStats', false) : await storage.get('compactStats', false);
             const showMessageIds = cache ? await cache.get(SHOW_MESSAGE_IDS_KEY, false) : await storage.get(SHOW_MESSAGE_IDS_KEY, false);
 
-            debugLog('[Core] Settings:', { statsEnabled, timestampEnabled, showModelDetails, showMessageIds });
+            debugLog('[Core] Settings:', { statsEnabled, timestampEnabled, showModelDetails, compactStats, showMessageIds });
             
             // Build updated display
             let displayLines = [];
@@ -15306,7 +15879,9 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                     modelDisplay = modelDisplay.split('→')[0].trim();
                 }
                 displayLines.push(modelDisplay);
-                displayLines.push(`Tokens: ${generationStats.max_tokens} | Temp: ${generationStats.temperature.toFixed(2)} | Top P: ${generationStats.top_p} | Top K: ${generationStats.top_k}`);
+                displayLines.push(compactStats
+                    ? `${generationStats.max_tokens} | ${generationStats.temperature.toFixed(2)} | ${generationStats.top_p} | ${generationStats.top_k}`
+                    : `Tokens: ${generationStats.max_tokens} | Temp: ${generationStats.temperature.toFixed(2)} | Top P: ${generationStats.top_p} | Top K: ${generationStats.top_k}`);
             }
             
             if (timestampEnabled && hasTimestamp) {
@@ -16398,33 +16973,52 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
     const hasAlreadyReloaded = sessionStorage.getItem(RELOAD_FLAG_KEY) === 'true';
 
     // =============================================================================
-    // ===                    UPDATE NOTIFICATION MODAL                         ===
+    // ===              CHANGELOG DATA + MODAL SHELL (shared)                   ===
     // =============================================================================
-    // Show update notification modal with changelog after extension update
-    // NOTE: This function must be defined OUTSIDE initializeMainCode so it can be
-    // called from checkForUpdateNotification (which also runs outside initializeMainCode)
-    function showUpdateNotificationModal(version) {
-        debugLog('[Core] Showing update notification for version:', version);
+    // Release notes live in changelog.json (one small, easy-to-edit file) instead
+    // of being hardcoded here. Add a new version entry there on every release.
+    // NOTE: These must be defined OUTSIDE initializeMainCode so they can be called
+    // from checkForUpdateNotification and the onMessage listener (which also run
+    // outside initializeMainCode).
+    let _changelogCache = null;
+    let _lastRenderedUpdateVersion = null;
 
-        // Get changelog data from global CHANGELOG object (defined at top of file)
-        const changelogData = CHANGELOG[version] || {
-            title: `Version ${version}`,
+    async function loadChangelogData() {
+        if (_changelogCache) return _changelogCache;
+        try {
+            const api = typeof browser !== 'undefined' ? browser : chrome;
+            const res = await fetch(api.runtime.getURL('changelog.json'));
+            const data = await res.json();
+            _changelogCache = Array.isArray(data) ? data : [];
+        } catch (err) {
+            console.error('[Core] Failed to load changelog.json:', err);
+            _changelogCache = [];
+        }
+        return _changelogCache;
+    }
+
+    function buildFallbackChangelogEntry(version) {
+        return {
+            version,
             date: new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }),
-            features: ['Niiiiiiiiice...', 'You can now use Google Drive to backup and synchronize your generation statistics, styles and settings across devices! Go to the Data tab and sign in with your Google account to get started.','Fixed gap on right side when Sidebar Layout is enabled','Fixed crash on iOS when Live Text Editor (WYSIWYG) is enabled']
+            features: ["Release notes for this version haven't been published yet — check back soon."]
         };
+    }
 
-        // Create container with shadow DOM
-        let updateModalRoot = document.getElementById('update-notification-root');
-        if (updateModalRoot) {
-            updateModalRoot.remove(); // Remove if already exists
+    // Shared shadow-DOM shell (backdrop + modal + styles) used by both the
+    // single-version update toast and the multi-version history viewer below.
+    function createChangelogModalShell() {
+        let root = document.getElementById('update-notification-root');
+        if (root) {
+            root.remove(); // Remove if already exists
         }
 
-        updateModalRoot = document.createElement('div');
-        updateModalRoot.id = 'update-notification-root';
-        updateModalRoot.style.cssText = 'position: fixed; inset: 0; pointer-events: none; z-index: 10000005;';
-        document.body.appendChild(updateModalRoot);
+        root = document.createElement('div');
+        root.id = 'update-notification-root';
+        root.style.cssText = 'position: fixed; inset: 0; pointer-events: none; z-index: 10000005;';
+        document.body.appendChild(root);
 
-        const shadow = updateModalRoot.attachShadow({ mode: 'open' });
+        const shadow = root.attachShadow({ mode: 'open' });
 
         // Styles
         const style = document.createElement('style');
@@ -16597,6 +17191,8 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
                 border-top: 1px solid #e5e7eb;
                 display: flex;
                 justify-content: center;
+                flex-wrap: wrap;
+                gap: 0.75rem;
             }
 
             @media (prefers-color-scheme: dark) {
@@ -16627,103 +17223,287 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
             .btn-close:active {
                 transform: translateY(0);
             }
+
+            .btn-secondary {
+                background: transparent;
+                color: #374151;
+                border: 1px solid #d1d5db;
+                border-radius: 8px;
+                padding: 0.625rem 1.25rem;
+                font-size: 0.9375rem;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.2s;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            }
+
+            .btn-secondary:hover {
+                background: #f3f4f6;
+                border-color: #9ca3af;
+            }
+
+            @media (prefers-color-scheme: dark) {
+                .btn-secondary {
+                    color: #d1d5db;
+                    border-color: #4b5563;
+                }
+                .btn-secondary:hover {
+                    background: #374151;
+                }
+            }
+
+            .history-version-block {
+                text-align: left;
+                padding-bottom: 1rem;
+                margin-bottom: 1rem;
+                border-bottom: 1px solid #e5e7eb;
+            }
+
+            .history-version-block:last-child {
+                border-bottom: none;
+                margin-bottom: 0;
+                padding-bottom: 0;
+            }
+
+            @media (prefers-color-scheme: dark) {
+                .history-version-block {
+                    border-color: #404040;
+                }
+            }
+
+            .history-version-title {
+                font-size: 1rem;
+                font-weight: 700;
+                margin-bottom: 0.125rem;
+                color: #111827;
+            }
+
+            @media (prefers-color-scheme: dark) {
+                .history-version-title {
+                    color: #f9fafb;
+                }
+            }
         `;
 
-        // Create backdrop
         const backdrop = document.createElement('div');
         backdrop.className = 'backdrop';
 
-        // Create modal
         const modal = document.createElement('div');
         modal.className = 'modal';
-        
-        // Create modal header
-        const modalHeader = document.createElement('div');
-        modalHeader.className = 'modal-header';
-        
-        // Add "S.AI Toolkit updated!" at the top
-        const updateAnnouncement = document.createElement('div');
-        updateAnnouncement.style.cssText = 'font-size: 0.875rem; font-weight: 600; color: #3b82f6; margin-bottom: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;';
-        updateAnnouncement.textContent = 'S.AI Toolkit updated!';
-        
-        const updateIcon = document.createElement('div');
-        updateIcon.className = 'update-icon';
-        updateIcon.textContent = '🎉';
-        
-        const modalTitle = document.createElement('div');
-        modalTitle.className = 'modal-title';
-        modalTitle.textContent = changelogData.title;
-        
-        const modalDate = document.createElement('div');
-        modalDate.className = 'modal-date';
-        modalDate.textContent = changelogData.date;
-        
-        modalHeader.appendChild(updateAnnouncement);
-        modalHeader.appendChild(updateIcon);
-        modalHeader.appendChild(modalTitle);
-        modalHeader.appendChild(modalDate);
-        
-        // Create modal body
-        const modalBody = document.createElement('div');
-        modalBody.className = 'modal-body';
-        
-        const changelogTitle = document.createElement('div');
-        changelogTitle.className = 'changelog-title';
-        changelogTitle.textContent = "What's New";
-        
-        const changelogList = document.createElement('ul');
-        changelogList.className = 'changelog-list';
-        
-        changelogData.features.forEach(feature => {
-            const li = document.createElement('li');
-            li.className = 'changelog-item';
-            li.textContent = feature;
-            changelogList.appendChild(li);
-        });
-        
-        modalBody.appendChild(changelogTitle);
-        modalBody.appendChild(changelogList);
-        
-        // Create modal footer
-        const modalFooter = document.createElement('div');
-        modalFooter.className = 'modal-footer';
-        
-        const closeBtn = document.createElement('button');
-        closeBtn.className = 'btn-close';
-        closeBtn.id = 'close-btn';
-        closeBtn.textContent = 'Got it!';
-        
-        modalFooter.appendChild(closeBtn);
-        
-        // Assemble modal
-        modal.appendChild(modalHeader);
-        modal.appendChild(modalBody);
-        modal.appendChild(modalFooter);
+        modal.addEventListener('click', (e) => e.stopPropagation());
 
         shadow.appendChild(style);
         shadow.appendChild(backdrop);
         shadow.appendChild(modal);
 
-        // Close handler
+        return { root, backdrop, modal };
+    }
+
+    function closeChangelogModal(root, backdrop, modal) {
+        backdrop.style.animation = 'fadeIn 0.2s ease-out reverse';
+        modal.style.animation = 'slideIn 0.2s ease-out reverse';
+        setTimeout(() => root.remove(), 200);
+    }
+
+    // Single-version "toast" shown right after an update. Marks the version as
+    // seen in storage on dismiss, so it won't show again for this version.
+    async function showUpdateNotificationModal(version) {
+        debugLog('[Core] Showing update notification for version:', version);
+
+        // Guard against the load-time check and the background push message
+        // both trying to render the same version's modal within a moment of
+        // each other.
+        if (_lastRenderedUpdateVersion === version && document.getElementById('update-notification-root')) {
+            debugLog('[Core] Update modal already showing for', version, '- skipping duplicate');
+            return;
+        }
+        _lastRenderedUpdateVersion = version;
+
+        const changelog = await loadChangelogData();
+        const entry = changelog.find(e => e.version === version) || buildFallbackChangelogEntry(version);
+
+        const { root, backdrop, modal } = createChangelogModalShell();
+
+        // Create modal header
+        const modalHeader = document.createElement('div');
+        modalHeader.className = 'modal-header';
+
+        // Add "S.AI Toolkit updated!" at the top
+        const updateAnnouncement = document.createElement('div');
+        updateAnnouncement.style.cssText = 'font-size: 0.875rem; font-weight: 600; color: #3b82f6; margin-bottom: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;';
+        updateAnnouncement.textContent = 'S.AI Toolkit updated!';
+
+        const updateIcon = document.createElement('div');
+        updateIcon.className = 'update-icon';
+        updateIcon.textContent = '🎉';
+
+        const modalTitle = document.createElement('div');
+        modalTitle.className = 'modal-title';
+        modalTitle.textContent = `Version ${entry.version}`;
+
+        const modalDate = document.createElement('div');
+        modalDate.className = 'modal-date';
+        modalDate.textContent = entry.date;
+
+        modalHeader.appendChild(updateAnnouncement);
+        modalHeader.appendChild(updateIcon);
+        modalHeader.appendChild(modalTitle);
+        modalHeader.appendChild(modalDate);
+
+        // Create modal body
+        const modalBody = document.createElement('div');
+        modalBody.className = 'modal-body';
+
+        const changelogTitle = document.createElement('div');
+        changelogTitle.className = 'changelog-title';
+        changelogTitle.textContent = "What's New";
+
+        const changelogList = document.createElement('ul');
+        changelogList.className = 'changelog-list';
+
+        (entry.features || []).forEach(feature => {
+            const li = document.createElement('li');
+            li.className = 'changelog-item';
+            li.textContent = feature;
+            changelogList.appendChild(li);
+        });
+
+        modalBody.appendChild(changelogTitle);
+        modalBody.appendChild(changelogList);
+
+        // Create modal footer
+        const modalFooter = document.createElement('div');
+        modalFooter.className = 'modal-footer';
+
+        const viewChangelogBtn = document.createElement('button');
+        viewChangelogBtn.className = 'btn-secondary';
+        viewChangelogBtn.id = 'view-changelog-btn';
+        viewChangelogBtn.textContent = 'View Changelog';
+
+        const closeBtn = document.createElement('button');
+        closeBtn.className = 'btn-close';
+        closeBtn.id = 'close-btn';
+        closeBtn.textContent = 'Got it!';
+
+        modalFooter.appendChild(viewChangelogBtn);
+        modalFooter.appendChild(closeBtn);
+
+        modal.appendChild(modalHeader);
+        modal.appendChild(modalBody);
+        modal.appendChild(modalFooter);
+
         async function closeModal() {
             // Mark this version as seen
             await storage.set('lastSeenVersion', version);
             debugLog('[Core] Update notification dismissed, marked version as seen:', version);
-
-            // Animate out
-            backdrop.style.animation = 'fadeIn 0.2s ease-out reverse';
-            modal.style.animation = 'slideIn 0.2s ease-out reverse';
-
-            setTimeout(() => {
-                updateModalRoot.remove();
-            }, 200);
+            closeChangelogModal(root, backdrop, modal);
         }
 
         closeBtn.addEventListener('click', closeModal);
         backdrop.addEventListener('click', closeModal);
 
-        // Prevent modal click from closing
-        modal.addEventListener('click', (e) => e.stopPropagation());
+        // Give the user a way to see previous releases' notes too, not just
+        // this one. Counts as acknowledging the update (marks lastSeenVersion)
+        // so the toast doesn't come back on the next page load - it just
+        // hands off straight into the history viewer instead of animating
+        // closed first (createChangelogModalShell tears down this modal's
+        // root for us when the history modal builds its own).
+        viewChangelogBtn.addEventListener('click', async () => {
+            await storage.set('lastSeenVersion', version);
+            debugLog('[Core] Update notification dismissed via View Changelog, marked version as seen:', version);
+            showChangelogHistoryModal();
+        });
+    }
+
+    // Multi-version "browse anytime" history viewer. Purely a read action -
+    // never touches lastSeenVersion, so it can be opened repeatedly without
+    // affecting the update-toast logic above.
+    async function showChangelogHistoryModal(limit = 5) {
+        debugLog('[Core] Showing changelog history modal');
+
+        const changelog = await loadChangelogData();
+        const entries = changelog.slice(0, limit);
+
+        const { root, backdrop, modal } = createChangelogModalShell();
+
+        const modalHeader = document.createElement('div');
+        modalHeader.className = 'modal-header';
+
+        const headerLabel = document.createElement('div');
+        headerLabel.style.cssText = 'font-size: 0.875rem; font-weight: 600; color: #3b82f6; margin-bottom: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;';
+        headerLabel.textContent = 'S.AI Toolkit';
+
+        const updateIcon = document.createElement('div');
+        updateIcon.className = 'update-icon';
+        updateIcon.textContent = '📋';
+
+        const modalTitle = document.createElement('div');
+        modalTitle.className = 'modal-title';
+        modalTitle.textContent = "What's New";
+
+        modalHeader.appendChild(headerLabel);
+        modalHeader.appendChild(updateIcon);
+        modalHeader.appendChild(modalTitle);
+
+        const modalBody = document.createElement('div');
+        modalBody.className = 'modal-body';
+
+        if (entries.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'changelog-item';
+            empty.style.paddingLeft = '0';
+            empty.textContent = 'No release notes available yet.';
+            modalBody.appendChild(empty);
+        } else {
+            entries.forEach(entry => {
+                const block = document.createElement('div');
+                block.className = 'history-version-block';
+
+                const versionTitle = document.createElement('div');
+                versionTitle.className = 'history-version-title';
+                versionTitle.textContent = `Version ${entry.version}`;
+
+                const versionDate = document.createElement('div');
+                versionDate.className = 'modal-date';
+                versionDate.style.marginBottom = '0.5rem';
+                versionDate.textContent = entry.date;
+
+                const list = document.createElement('ul');
+                list.className = 'changelog-list';
+
+                (entry.features || []).forEach(feature => {
+                    const li = document.createElement('li');
+                    li.className = 'changelog-item';
+                    li.textContent = feature;
+                    list.appendChild(li);
+                });
+
+                block.appendChild(versionTitle);
+                block.appendChild(versionDate);
+                block.appendChild(list);
+                modalBody.appendChild(block);
+            });
+        }
+
+        const modalFooter = document.createElement('div');
+        modalFooter.className = 'modal-footer';
+
+        const closeBtn = document.createElement('button');
+        closeBtn.className = 'btn-close';
+        closeBtn.textContent = 'Close';
+
+        modalFooter.appendChild(closeBtn);
+
+        modal.appendChild(modalHeader);
+        modal.appendChild(modalBody);
+        modal.appendChild(modalFooter);
+
+        function closeModal() {
+            closeChangelogModal(root, backdrop, modal);
+        }
+
+        closeBtn.addEventListener('click', closeModal);
+        backdrop.addEventListener('click', closeModal);
     }
 
     // =============================================================================
@@ -16824,6 +17604,20 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         // Check for update notification after initialization
         await checkForUpdateNotification();
 
+        // If the popup asked us to show the changelog history (opened via
+        // "What's New" while no SpicyChat tab was open), do it once the page
+        // has settled.
+        try {
+            const api = typeof browser !== 'undefined' ? browser : chrome;
+            const { openChangelogHistoryOnLoad } = await api.storage.local.get({ openChangelogHistoryOnLoad: false });
+            if (openChangelogHistoryOnLoad) {
+                await storage.remove('openChangelogHistoryOnLoad');
+                setTimeout(() => showChangelogHistoryModal(), 1200);
+            }
+        } catch (err) {
+            debugLog('[Core] Error checking openChangelogHistoryOnLoad flag:', err);
+        }
+
         // Only check on chat pages
         const isChatPage = location.href.includes('/chat') || location.href.includes('/messages');
         debugLog('[Core] isChatPage:', isChatPage);
@@ -16880,6 +17674,14 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
     const _runtimeAPI = typeof browser !== 'undefined' ? browser : chrome;
     if (_runtimeAPI?.runtime?.onMessage) {
         _runtimeAPI.runtime.onMessage.addListener((message) => {
+            if (message.type === 'SAI_EXTENSION_UPDATED') {
+                debugLog('[Core] SAI_EXTENSION_UPDATED received for version:', message.version);
+                showUpdateNotificationModal(message.version);
+            }
+            if (message.type === 'SAI_SHOW_CHANGELOG_HISTORY') {
+                debugLog('[Core] SAI_SHOW_CHANGELOG_HISTORY received');
+                showChangelogHistoryModal();
+            }
             if (message.type === 'SAI_DRIVE_SYNC_COMPLETE') {
                 debugLog('[Sync] SAI_DRIVE_SYNC_COMPLETE received — invalidating cache and re-rendering stats');
                 if (typeof invalidateStatsCache === 'function') invalidateStatsCache();

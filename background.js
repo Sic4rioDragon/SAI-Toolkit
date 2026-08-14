@@ -27,7 +27,7 @@ const DRIVE_CLIENT_ID       = '398869461517-v31635ukag9i28skpmf1e093dab9b37o.app
 const DRIVE_SCOPE           = 'https://www.googleapis.com/auth/drive.file';
 // Relay redirect URI for the tab-based code flow (browsers where launchWebAuthFlow doesn't work, e.g. iOS).
 // Must match an Authorised Redirect URI in Google Cloud Console.
-const PKCE_RELAY_URL        = 'https://onyxmizuna.github.io/SAI-Toolkit/oauth-callback';
+const PKCE_RELAY_URL        = 'https://oauth-relay.onyxmizuna.eu/oauth-callback';
 // OAuth token broker (Cloudflare Worker) that holds the client_secret and runs the
 // authorization-code / refresh-token exchanges server-side. See spicychat/token-broker/.
 // TODO: set this to your deployed Worker URL after `wrangler deploy`.
@@ -48,7 +48,7 @@ const SETTINGS_SYNC_KEYS = [
     'showChatNameInTitle', 'nsfwToggleEnabled', 'messageRecoveryEnabled',
     'enableWysiwygEditor', 'enableGenerationProfiles',
     'enableSmallProfileImages', 'enableRoundedProfileImages',
-    'swapCheckboxPosition', 'squareMessageEdges',
+    'enableSwapCheckboxPosition', 'enableSquareMessageEdges',
     'highlightModelChanges', 'autoRegenOnMismatch', 'autoRegenOnShort',
     'autoRegenMaxAttempts', 'messageContainerMaxWidth',
     'memoryDotEnabled', 'memoryDotColor', 'hideCreatorName',
@@ -104,17 +104,23 @@ const IDB_CHAR_INDEX = 'by_character';
 const IDB_EXPORT_BUCKET = '_default';   // synthetic conversation bucket for the nested wire format
 const STATS_MIGRATION_FLAG = 'statsMigratedToIDB';
 const IDB_WRITE_CHUNK = 1000;           // bulk-write batch size — keeps iOS/WebKit transactions small
+const STATS_OPEN_TIMEOUT_MS = 8000;     // a healthy indexedDB.open resolves in ms; on Orion a
+                                        // post-suspend open can hang forever with NO event firing
+const STATS_MIGRATION_TIMEOUT_MS = 120000; // one-time first-run migration of the legacy blob can be
+                                        // large; it gets its OWN generous cap (separate from the
+                                        // per-op backstop) so a slow-but-progressing migration is
+                                        // never killed — but a HUNG one still rejects + resets its gate
+const STATS_RETRY_BACKOFF_MS = [250, 750]; // backoffs for getLiveStatsDB reopen + the merge-step retry
 
 let _statsDbPromise = null;
 
 function openStatsDB() {
     if (_statsDbPromise) return _statsDbPromise;
-    _statsDbPromise = new Promise((resolve, reject) => {
+    const openPromise = new Promise((resolve, reject) => {
         let req;
         try {
             req = indexedDB.open(IDB_NAME, IDB_VERSION);
         } catch (e) {
-            _statsDbPromise = null;
             reject(e);
             return;
         }
@@ -127,15 +133,37 @@ function openStatsDB() {
         };
         req.onsuccess = () => {
             const db = req.result;
-            // Drop the cached connection if it is force-closed (e.g. background teardown)
-            // or superseded by a version change, so the next op reopens a fresh one.
-            db.onclose = () => { _statsDbPromise = null; };
-            db.onversionchange = () => { try { db.close(); } catch (_) {} _statsDbPromise = null; };
+            // Drop the cached connection if THIS handle is force-closed (background teardown) or
+            // superseded by a version change, so the next op reopens fresh — but only if it is
+            // still the cached one. closeStatsDB() can close an OLD handle after a newer connection
+            // has already been cached; without this identity guard the old handle's late onclose
+            // would null the healthy new cache (benign — just an extra reopen — but avoidable).
+            const dropIfCurrent = () => {
+                if (!_statsDbPromise) return;
+                _statsDbPromise.then(d => { if (d === db) _statsDbPromise = null; }).catch(() => {});
+            };
+            db.onclose = dropIfCurrent;
+            db.onversionchange = () => { try { db.close(); } catch (_) {} dropIfCurrent(); };
             resolve(db);
         };
-        req.onerror = () => { _statsDbPromise = null; reject(req.error); };
+        req.onerror = () => reject(req.error);
     });
+    // Time-box the open itself. The open is awaited OUTSIDE statsOp's per-op timeout, so a hung
+    // open (Orion post-suspend: no onsuccess/onerror ever fires) would otherwise wedge the
+    // serialized stats queue forever. On timeout/error, clear the cache so the next op reopens.
+    _statsDbPromise = withStatsTimeout(openPromise, STATS_OPEN_TIMEOUT_MS, 'open')
+        .catch(err => { _statsDbPromise = null; throw err; });
     return _statsDbPromise;
+}
+
+// Drop the cached IDB connection so it cannot straddle an OS-suspend window (the long Orion
+// sign-in tab flow) and come back a zombie whose transactions never fire. Nulling the cache
+// synchronously guarantees the next openStatsDB() opens fresh on the awake page; the old handle
+// is closed best-effort (IndexedDB defers the actual close until in-flight txns finish).
+function closeStatsDB() {
+    const p = _statsDbPromise;
+    _statsDbPromise = null;
+    if (p) p.then(db => { try { db.close(); } catch (_) {} }).catch(() => {});
 }
 
 // A stat leaf carries data worth keeping iff it has a model or any non-null param.
@@ -402,7 +430,7 @@ async function idbPrune(db) {
 let _statsMigrationPromise = null;
 function ensureStatsMigrated() {
     if (_statsMigrationPromise) return _statsMigrationPromise;
-    _statsMigrationPromise = (async () => {
+    _statsMigrationPromise = withStatsTimeout((async () => {
         const flag = await storageAPI.storage.local.get(STATS_MIGRATION_FLAG);
         if (flag[STATS_MIGRATION_FLAG]) return;
         const t0 = Date.now();
@@ -415,14 +443,29 @@ function ensureStatsMigrated() {
         const botCount = Object.keys(blob).length;
         if (botCount) {
             const db = await getLiveStatsDB();
-            const n = await idbBulkMergeNested(db, blob);
+            // The legacy-blob migration is a long, message-silent bulk merge — the same suspendable
+            // window as the Drive merge — but it runs at startup with no sync tabId. Resolve a (prefer
+            // active) SpicyChat tab so a content-script heartbeat can keep the bg awake through it.
+            // Best-effort: if none is open, runWithMergeHeartbeat proceeds and the withStatsTimeout cap
+            // is the only backstop. Covers first-run / first-upgrade-from-pre-IDB on Orion.
+            let _migTab = null;
+            try {
+                const tabs = await storageAPI.tabs.query({ url: '*://spicychat.ai/*' });
+                const live = (tabs || []).find(t => t.active) || (tabs || [])[0];
+                _migTab = live ? live.id : null;
+            } catch (_) {}
+            const n = await runWithMergeHeartbeat(_migTab, () => idbBulkMergeNested(db, blob));
             console.log(`[Stats IDB] migrated ${n} message records from ${botCount} bots in ${Date.now() - t0} ms`);
         } else {
             console.log('[Stats IDB] migration: no legacy blob to import');
         }
         await storageAPI.storage.local.set({ [STATS_MIGRATION_FLAG]: true });
-    })().catch(err => {
-        // Reset so a later access can retry rather than being permanently wedged.
+    })(), STATS_MIGRATION_TIMEOUT_MS, 'migrate').catch(err => {
+        // Reset the gate so a later access rebuilds migration on a fresh connection. The
+        // withStatsTimeout above is what makes this reset reliable: a HUNG migration (a zombie
+        // txn mid-putAll after an OS suspend) now REJECTS at the cap instead of leaving this
+        // promise pending forever — which would otherwise wedge every later stats op at the
+        // per-op cap (the same hang, re-skinned). A slow-but-progressing migration is unaffected.
         _statsMigrationPromise = null;
         console.warn('[Stats IDB] migration failed:', err && err.message);
         throw err;
@@ -453,6 +496,15 @@ let _statsOpQueue = Promise.resolve();
 const STATS_PROBE_TIMEOUT_MS = 4000;    // a live connection answers a trivial txn in ms
 const STATS_OP_TIMEOUT_MS    = 60000;   // backstop only — real ops (incl. large chunked writes) finish well under this
 
+// Invariant: getLiveStatsDB's worst-case open+probe retry budget must stay UNDER the per-op cap,
+// or a slow-but-recovering post-suspend connection would be killed as a spurious op-timeout
+// instead of recovering. Today: (8000+4000)*3 + (250+750) = 37000 < 60000. This guard fires only
+// if a future tuning of any of these constants breaks that headroom — it never fires as shipped.
+if ((STATS_OPEN_TIMEOUT_MS + STATS_PROBE_TIMEOUT_MS) * (STATS_RETRY_BACKOFF_MS.length + 1)
+    + STATS_RETRY_BACKOFF_MS.reduce((a, b) => a + b, 0) >= STATS_OP_TIMEOUT_MS) {
+    console.warn('[Stats IDB] config: getLiveStatsDB retry budget >= STATS_OP_TIMEOUT_MS — slow post-suspend recoveries may be killed as op-timeouts; raise STATS_OP_TIMEOUT_MS or lower the open/probe/backoff values.');
+}
+
 function withStatsTimeout(promise, ms, label) {
     let timer;
     const timeout = new Promise((_, reject) => {
@@ -476,19 +528,31 @@ function probeStatsDB(db) {
     }), STATS_PROBE_TIMEOUT_MS, 'probe');
 }
 
-// Open the DB and verify it responds; if the cached connection is a post-suspend zombie,
-// discard it and reopen a fresh one.
+function statsDelay(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// Open the DB and verify it actually responds. A post-suspend zombie connection (cached OR
+// freshly opened) answers no events; probe it, and on failure reopen and RE-PROBE with a short
+// backoff — because immediately post-resume even a just-reopened handle can still be stale until
+// WebKit's storage subsystem recovers. Retrying here turns a second consecutive zombie into a
+// ~few-second recovery instead of a 60s op-timeout, which is what lets the merge succeed on (or
+// near) the first attempt on Orion rather than failing and needing a manual re-tap.
 async function getLiveStatsDB() {
-    let db = await openStatsDB();
-    try {
-        await probeStatsDB(db);
-    } catch (e) {
-        console.warn('[Stats IDB] connection probe failed — reopening:', e && e.message);
-        try { db.close(); } catch (_) {}
-        _statsDbPromise = null;
-        db = await openStatsDB();
+    let lastErr;
+    for (let attempt = 0; attempt <= STATS_RETRY_BACKOFF_MS.length; attempt++) {
+        let db = null;
+        try {
+            db = await openStatsDB();
+            await probeStatsDB(db);
+            return db;
+        } catch (e) {
+            lastErr = e;
+            console.warn('[Stats IDB] connection check failed — reopening (attempt ' + (attempt + 1) + '):', e && e.message);
+            if (db) { try { db.close(); } catch (_) {} }
+            _statsDbPromise = null;
+            if (attempt < STATS_RETRY_BACKOFF_MS.length) await statsDelay(STATS_RETRY_BACKOFF_MS[attempt]);
+        }
     }
-    return db;
+    throw lastErr;
 }
 
 // Run a stats DB operation: wait for migration, get a verified-live connection, then run
@@ -497,18 +561,37 @@ async function getLiveStatsDB() {
 // the queue permanently; on failure the cached connection is dropped so the next op
 // reopens fresh. Errors are isolated so one failure can't wedge the queue.
 function statsOp(fn) {
+    // Time-box the connection open/probe AND fn(db). On Orion a post-suspend `indexedDB.open`, or
+    // a transaction on a zombie connection, can hang with NO event ever firing; because every op
+    // is serialized through _statsOpQueue, an un-time-boxed hang here would wedge the queue forever
+    // (the "Merging data…" hang — the merge op queues behind a dead op and never even starts, so no
+    // probe/op-timeout log ever appears). Migration is the ONE thing run outside this race — see
+    // below — because it has its own (longer) cap and capping it twice would re-introduce the wedge.
     const run = _statsOpQueue.catch(() => {}).then(async () => {
+        // Run migration to completion BEFORE starting the per-op clock. A legitimate one-time
+        // first-run migration of a large legacy blob can exceed STATS_OP_TIMEOUT_MS, and it is
+        // already time-boxed by its own generous cap inside ensureStatsMigrated(). Boxing it here
+        // too would kill a slow-but-valid migration AND leave its promise pending — re-wedging
+        // every later op. (ensureStatsMigrated() can no longer hang, so awaiting it here is safe.)
+        // Past migration, time-box open+probe+fn — the real never-settle hang targets.
         await ensureStatsMigrated();
-        const db = await getLiveStatsDB();
-        try {
-            return await withStatsTimeout(Promise.resolve().then(() => fn(db)), STATS_OP_TIMEOUT_MS, 'op');
-        } catch (err) {
-            // The op never settled (or errored) — the cached connection is suspect.
-            // Drop it so the next op reopens a fresh one instead of reusing a dead handle.
-            _statsDbPromise = null;
-            try { db.close(); } catch (_) {}
-            throw err;
-        }
+        return withStatsTimeout((async () => {
+            const db = await getLiveStatsDB();
+            try {
+                return await fn(db);
+            } catch (err) {
+                try { db.close(); } catch (_) {}
+                throw err;
+            }
+        })(), STATS_OP_TIMEOUT_MS, 'op');
+    }).catch(err => {
+        // Any failure/timeout: drop the cached connection so the next op reopens a fresh one
+        // instead of reusing a (possibly dead) handle, and so the queue is never left chained to a
+        // wedged op. Also clear a stuck migration gate on timeout — belt-and-suspenders so a
+        // hung/abandoned migration is rebuilt next time rather than re-awaited forever.
+        _statsDbPromise = null;
+        if (err && /timed out/.test(err.message)) _statsMigrationPromise = null;
+        throw err;
     });
     _statsOpQueue = run.catch(() => {});
     return run;
@@ -663,6 +746,12 @@ async function getAccessTokenTabFlow() {
         storageAPI.tabs.onRemoved.addListener(onRemoved);
 
         console.log('[Sync] tabFlow: opening Google sign-in tab — redirect URI:', redirectURL);
+        // Suspend-window guard: drop any cached IDB connection BEFORE the multi-second sign-in tab,
+        // during which Orion can OS-suspend the background page. With no live handle open across the
+        // suspend, nothing can come back a zombie — the merge afterwards opens a fresh connection on
+        // the awake page. This is the "reliable from the get-go" move: prevent the straddle that
+        // causes the post-resume zombie rather than only recovering from it.
+        try { closeStatsDB(); } catch (_) {}
         storageAPI.tabs.create({ url: authUrl })
             .then(tab => { authTabId = tab.id; console.log('[Sync] tabFlow: auth tab created, id:', tab.id); })
             .catch(err => { console.error('[Sync] tabFlow: failed to create auth tab:', err.message); cleanup(); reject(err); });
@@ -749,6 +838,27 @@ let _downloadResolve = null;
 let _downloadReject  = null;
 let _uploadResolve   = null;
 let _uploadReject    = null;
+
+// Bracket a background-only IndexedDB merge with a content-script heartbeat. On Orion/iOS the
+// background page is OS-suspended during a message-silent compute window (the merge), freezing its
+// event loop AND its watchdog timers — only an INCOMING message from the always-alive foreground
+// content script wakes it (a manual page refresh is what used to rescue it). We ask a content tab to
+// ping us for the duration, so the merge runs to completion for EVERY path — manual sync, auto-sync,
+// restore, import — not just the manual UI path. Best-effort: if no tab answers BEGIN we proceed
+// anyway (statsOp's retry remains the backstop); END is always sent (finally) so the tab stops.
+async function runWithMergeHeartbeat(tabId, fn) {
+    let begun = false;
+    if (tabId != null) {
+        try { await storageAPI.tabs.sendMessage(tabId, { type: 'SAI_MERGE_HEARTBEAT_BEGIN' }); begun = true; } catch (_) {}
+    }
+    try {
+        return await fn();
+    } finally {
+        if (begun) {
+            try { await storageAPI.tabs.sendMessage(tabId, { type: 'SAI_MERGE_HEARTBEAT_END' }); } catch (_) {}
+        }
+    }
+}
 
 function friendlyError(err) {
     const msg = (err && err.message) ? err.message : String(err);
@@ -1230,28 +1340,46 @@ async function _doSync(interactive, syncOptions, tabId) {
     if (syncStats) {
         // Old-format file: entire file was the raw stats object
         const remoteStats = isV2 ? (remote ? remote.stats || {} : {}) : (remote || {});
-        if (fileId) {
-            // Merge remote into the local IndexedDB store, per-message, collapsing the
-            // conversation level. mergeMessageEntry semantics — never clobbers a richer
-            // entry. Each statsOp is individually serialised; a live write may land in the
-            // gap before the export below, which is fine — it is a real write and is
-            // correctly included in the uploaded snapshot. Idempotent, so the AUTH_EXPIRED
-            // retry can run it again safely.
-            const tMerge = Date.now();
-            const remoteBots = Object.keys(remoteStats).length;
-            const written = await statsOp(db => idbBulkMergeNested(db, remoteStats));
-            console.log('[Sync] _doSync: merged remote stats into IDB in', Date.now() - tMerge,
-                'ms — remote bots:', remoteBots, '| records upserted:', written);
-        }
-        // Assemble the (pruned) nested wire format from the DB for upload. The store is
-        // the source of truth; we no longer keep an 11 MB JSON blob in storage.local.
-        const tExport = Date.now();
-        const merged = await statsOp(db => idbExportNested(db));
+        const remoteBots = Object.keys(remoteStats).length;
+        // Merge remote into the local IndexedDB store (per-message, collapsing the conversation
+        // level; mergeMessageEntry semantics never clobber a richer entry) and assemble the upload
+        // snapshot — with ONE invisible retry on a fresh connection. On Orion the page can be
+        // OS-suspended mid-merge AFTER the connection probe already passed, leaving a transaction
+        // that never fires; statsOp then times out. Rather than failing the whole sync and making
+        // the user re-tap, drop the stale handle and retry once. Safe because idbBulkMergeNested is
+        // idempotent (writes only changed records — near-zero the second time); the AUTH_EXPIRED
+        // retry path in runDriveSync is unchanged.
+        // Held awake by a content-script heartbeat for the whole merge window (see
+        // runWithMergeHeartbeat) — this is what makes auto-sync/restore work, not just the manual path.
+        const merged = await runWithMergeHeartbeat(tabId, async () => {
+            let m = null;
+            for (let attempt = 1; attempt <= 2; attempt++) {
+                try {
+                    if (fileId) {
+                        const tMerge = Date.now();
+                        const written = await statsOp(db => idbBulkMergeNested(db, remoteStats));
+                        console.log('[Sync] _doSync: merged remote stats into IDB in', Date.now() - tMerge,
+                            'ms — remote bots:', remoteBots, '| records upserted:', written);
+                    }
+                    // Assemble the (pruned) nested wire format from the DB for upload. The store is the
+                    // source of truth; we no longer keep an 11 MB JSON blob in storage.local.
+                    const tExport = Date.now();
+                    m = await statsOp(db => idbExportNested(db));
+                    console.log('[Sync] _doSync: assembled stats from IDB in', Date.now() - tExport, 'ms');
+                    break;
+                } catch (e) {
+                    if (attempt >= 2) throw e;
+                    console.warn('[Sync] _doSync: stats merge failed — retrying once on a fresh connection:', e && e.message);
+                    closeStatsDB();
+                    await statsDelay(500);
+                }
+            }
+            return m;
+        });
         const mergedBots = Object.keys(merged).length;
         const mergedMsgs = Object.values(merged).reduce((b, chats) =>
             b + Object.values(chats).reduce((c, msgs) => c + Object.keys(msgs).length, 0), 0);
-        console.log('[Sync] _doSync: assembled stats from IDB in', Date.now() - tExport, 'ms —',
-            mergedBots, 'bots |', mergedMsgs, 'messages total');
+        console.log('[Sync] _doSync: stats snapshot —', mergedBots, 'bots |', mergedMsgs, 'messages total');
         newFile.stats = merged;
     } else {
         // Preserve whatever stats already exist in Drive
@@ -1368,6 +1496,21 @@ function notifyAuthRequired() {
     });
 }
 
+// ---- Notify already-open SpicyChat tabs that the extension just updated ----
+// Best-effort: an already-injected content script's messaging context can be
+// invalidated by the browser on update (same class of issue storage-wrapper.js's
+// isContextValid() guards against). This push just gets the correct, fresh
+// changelog notes in front of the user immediately when it lands; the
+// load-time checkForUpdateNotification() path in content.js remains the
+// reliable fallback for whenever it doesn't (no tab open, or delivery fails).
+function notifyTabsOfExtensionUpdate(version) {
+    storageAPI.tabs.query({ url: '*://spicychat.ai/*' }, tabs => {
+        for (const tab of tabs) {
+            storageAPI.tabs.sendMessage(tab.id, { type: 'SAI_EXTENSION_UPDATED', version }).catch(() => {});
+        }
+    });
+}
+
 // ---- Auto-sync alarm ----
 
 storageAPI.alarms.onAlarm.addListener(async (alarm) => {
@@ -1382,7 +1525,13 @@ storageAPI.alarms.onAlarm.addListener(async (alarm) => {
         // path ignores tabId, so passing it (or null) is harmless there.
         const tabId = await new Promise(resolve => {
             storageAPI.tabs.query({ url: '*://spicychat.ai/*' }, tabs => {
-                resolve(tabs && tabs.length ? tabs[0].id : null);
+                // Prefer an ACTIVE (foreground) tab: its content script is alive and can drive the
+                // merge heartbeat (runWithMergeHeartbeat). A backgrounded tab on Orion is itself
+                // frozen and can't ping, so auto-sync's merge would run unprotected — picking the
+                // active tab gives it the best chance. Falls back to any tab for HTTP delegation.
+                const list = tabs || [];
+                const live = list.find(t => t.active) || list[0];
+                resolve(live ? live.id : null);
             });
         });
         const result = await runDriveSync(false, { syncStats: true, syncSettings: false, syncStyle: false }, tabId);
@@ -1419,6 +1568,7 @@ storageAPI.runtime.onInstalled.addListener(async (details) => {
             'updatedToVersion':       currentVersion
         });
         console.log('[Core] Update notification flag set successfully');
+        notifyTabsOfExtensionUpdate(currentVersion);
     }
 });
 
@@ -1451,6 +1601,17 @@ storageAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (message.type === 'ping') {
         sendResponse({ pong: true });
+        return true;
+    }
+
+    // Heartbeat from the (foreground, always-alive) content script during a Drive sync. On Orion/iOS
+    // an OPEN keepalive port does NOT stop the OS from suspending the background page during a
+    // message-silent window — notably the IndexedDB merge — which freezes its event loop AND its
+    // watchdog timers (a 5-min stall with the 60s 'op' timeout never firing, only resuming after a
+    // page refresh). Delivering this message wakes the page; receiving one every ~1s keeps it
+    // scheduled so the merge actually runs to completion. The handler only needs to exist + respond.
+    if (message.type === 'SAI_KEEPALIVE_PING') {
+        sendResponse({ alive: true });
         return true;
     }
 
@@ -1628,7 +1789,10 @@ storageAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (message.type === 'SAI_STATS_IMPORT_MERGE') {
-        statsOp(db => idbBulkMergeNested(db, message.stats || {}))
+        // Restore-from-backup / file-import run the SAME background-only merge as Drive sync, so they
+        // need the same suspend guard. Drive it from the originating tab.
+        const _importTab = sender && sender.tab ? sender.tab.id : null;
+        runWithMergeHeartbeat(_importTab, () => statsOp(db => idbBulkMergeNested(db, message.stats || {})))
             .then(written => sendResponse({ success: true, written }))
             .catch(err => sendResponse({ success: false, error: err.message }));
         return true;

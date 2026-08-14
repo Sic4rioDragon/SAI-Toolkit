@@ -1,0 +1,61 @@
+[
+  {
+    "version": "1.2.3",
+    "date": "August 11, 2026",
+    "features": [
+      "You can now revisit past release notes anytime — look for \"What's New\" in the toolbar popup, the Data tab of Settings, or the \"View Changelog\" button on the update notification itself",
+      "Update notifications are more reliable — they now show up right away with the correct notes for what actually changed, instead of sometimes lagging or showing outdated info",
+      "Fixed the live-formatting composer (WYSIWYG) sometimes duplicating text when accepting a suggestion from Grammarly or similar grammar-checking extensions"
+    ]
+  },
+  {
+    "version": "1.2.2",
+    "date": "August 9, 2026",
+    "features": [
+      "Fixed an overflow issue when Sidebar Layout is disabled"
+    ]
+  },
+  {
+    "version": "1.2.1",
+    "date": "August 8, 2026",
+    "features": [
+      "Fixed user text color in light/dark mode — split the color settings between user and bot, and between light and dark modes"
+    ]
+  },
+  {
+    "version": "1.2",
+    "date": "August 8, 2026",
+    "features": [
+      "Fixed the character info bar and Sidebar Layout's Generation Settings modal being forced into dark mode regardless of the active theme",
+      "Fixed the Custom Style settings panel having no light-mode colors at all (text was unreadable)",
+      "Custom Style now supports independent Light and Dark color profiles via a switch in the settings panel, instead of one shared color set",
+      "Custom Style's Light Mode defaults now match SpicyChat's native colors, so enabling it with nothing customized is a visual no-op",
+      "Fixed WYSIWYG composer text rendering invisible (white-on-white) in Light Mode when neither Custom Style nor Classic Style is active",
+      "Fixed the composer permanently losing cursor movement and syntax highlighting after starting a new chat on the same page",
+      "Fixed a gap between the chat scrollbar and the pinned Generation Settings/Memories sidebar panel",
+      "Fixed Google Drive \"Settings\" sync silently excluding two Layout toggles (Selection Checkboxes on Right Side, Square Message Box Edges)",
+      "Fixed \"Chat Name in Title\" no longer updating the browser tab title after SpicyChat changed its own title format",
+      "Hid the stale \"Hide Creator Name\" setting from the UI",
+      "Updated the privacy policy"
+    ]
+  },
+  {
+    "version": "1.1.1",
+    "date": "June 14, 2026",
+    "features": [
+      "Google Drive backup/sync, compact mobile generation statistics, and the iOS WYSIWYG fix from 1.1.0",
+      "Additional stability and reliability fixes for mobile devices",
+      "Fixed the pop-up window that appears when clicking the extension icon in the toolbar"
+    ]
+  },
+  {
+    "version": "1.1.0",
+    "date": "June 14, 2026",
+    "features": [
+      "You can now use Google Drive to backup and synchronize your generation statistics, styles and settings across devices — go to the Data tab and sign in with your Google account to get started. It will ONLY affect one folder on your Google Drive, so your personal data is safe",
+      "Implemented compact generation statistics for mobile devices, under Features → Generation Statistics",
+      "Fixed Live Text Formatting (WYSIWYG) on iOS",
+      "Massive stability and reliability fixes for mobile devices under the hood"
+    ]
+  }
+]
