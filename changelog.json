@@ -1,11 +1,36 @@
 [
   {
+    "version": "1.2.6",
+    "date": "August 16, 2026",
+    "features": [
+      "Fixed Sidebar Layout staying on when you navigate from a chat to a bot's edit page, which was cutting off the \"Attach Lorebook\" modal's buttons",
+      "Fixed generation stats and timestamps sometimes not appearing after switching between chats until you reloaded the page",
+      "Fixed \"Hide For You\" sometimes stopping working after moving between pages"
+    ]
+  },
+  {
+    "version": "1.2.5",
+    "date": "August 16, 2026",
+    "features": [
+      "Fixed Grammarly suggestions still not applying with Live Text Formatting turned on"
+    ]
+  },
+  {
+    "version": "1.2.4",
+    "date": "August 15, 2026",
+    "features": [
+      "Fixed Grammarly suggestions sometimes not applying with Live Text Formatting on",
+      "Fixed Enter sometimes toggling voice input instead of sending on some mobile browsers"
+    ]
+  },
+  {
     "version": "1.2.3",
     "date": "August 11, 2026",
     "features": [
       "You can now revisit past release notes anytime — look for \"What's New\" in the toolbar popup, the Data tab of Settings, or the \"View Changelog\" button on the update notification itself",
       "Update notifications are more reliable — they now show up right away with the correct notes for what actually changed, instead of sometimes lagging or showing outdated info",
-      "Fixed the live-formatting composer (WYSIWYG) sometimes duplicating text when accepting a suggestion from Grammarly or similar grammar-checking extensions"
+      "Fixed several conflicts between the live-formatting composer (WYSIWYG) and Grammarly (or similar grammar-checking extensions) — accepting a suggestion no longer duplicates text, and simple in-place corrections (like adding a comma or fixing capitalization) should now apply instead of silently doing nothing",
+      "Fixed Enter sometimes triggering the wrong button (e.g. toggling voice input instead of sending) on some mobile browser layouts"
     ]
   },
   {

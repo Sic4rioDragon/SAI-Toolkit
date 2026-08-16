@@ -4924,6 +4924,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     const DEFAULT_SIDEBAR_MIN_WIDTH = 1000; // Default minimum page width for sidebar layout
     
     let sidebarStyleElement = null;
+    let composerLayoutStyleElement = null; // Composer CSS: same "chat pages only" gating as Sidebar Layout, see toggleSidebarLayout
     let classicLayoutStyleElement = null;
     let classicStyleStyleElement = null;
     let compactGenerationStyleElement = null;
@@ -4936,6 +4937,7 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     let sidebarMinWidth = DEFAULT_SIDEBAR_MIN_WIDTH; // User-configurable minimum page width
     let sidebarAutoDisabled = false; // True when user has sidebar enabled but page is too narrow
     let sidebarUserEnabled = false; // Tracks user's actual preference (persisted to storage)
+    let sidebarPageDisabled = false; // True when CSS is off specifically because the current page is chatbot/edit, lorebook, create, or group
     
     // Check if current page should have sidebar layout disabled
     // Supports localized URLs: /{language}/lorebook, /{language}/chatbot/edit, /{language}/group
@@ -4948,13 +4950,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     async function toggleSidebarLayout(enable, saveToStorage = true) {
         // Don't enable sidebar on non-chat pages (lorebook, chatbot, group)
         const shouldBlock = enable && isNonChatPageForSidebar();
-        
+
         if (enable && !shouldBlock) {
             if (!sidebarStyleElement) {
                 // Check if early-injected element exists
-                sidebarStyleElement = document.getElementById('sai-toolkit-sidebar-layout-early') || 
+                sidebarStyleElement = document.getElementById('sai-toolkit-sidebar-layout-early') ||
                                       document.getElementById('sai-toolkit-sidebar-layout');
-                
+
                 if (!sidebarStyleElement) {
                     sidebarStyleElement = document.createElement('style');
                     sidebarStyleElement.id = 'sai-toolkit-sidebar-layout';
@@ -4968,6 +4970,25 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 }
             }
             sidebarStyleElement.disabled = false;
+            // Composer CSS (message input area styling) is designed specifically for
+            // sidebar layout and shares its "chat pages only" restriction — keep its
+            // enabled state in lockstep here rather than relying solely on the
+            // early-inject check, which only ever runs once per page load.
+            if (!composerLayoutStyleElement) {
+                composerLayoutStyleElement = document.getElementById('sai-toolkit-composer-layout-early') ||
+                                            document.getElementById('sai-toolkit-composer-layout');
+                if (!composerLayoutStyleElement) {
+                    composerLayoutStyleElement = document.createElement('style');
+                    composerLayoutStyleElement.id = 'sai-toolkit-composer-layout';
+                    composerLayoutStyleElement.textContent = getComposerLayoutCSSEarly();
+                    if (document.head.firstChild) {
+                        document.head.insertBefore(composerLayoutStyleElement, document.head.firstChild);
+                    } else {
+                        document.head.appendChild(composerLayoutStyleElement);
+                    }
+                }
+            }
+            composerLayoutStyleElement.disabled = false;
             // Body-class observer drives the new class-based selectors; start it
             // here in addition to the early-inject path so runtime toggles also
             // light up the layout correctly.
@@ -4983,6 +5004,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             if (sidebarStyleElement) {
                 // Don't remove the element, just disable it to avoid React re-render issues
                 sidebarStyleElement.disabled = true;
+            }
+            if (!composerLayoutStyleElement) {
+                composerLayoutStyleElement = document.getElementById('sai-toolkit-composer-layout-early') ||
+                                            document.getElementById('sai-toolkit-composer-layout');
+            }
+            if (composerLayoutStyleElement) {
+                composerLayoutStyleElement.disabled = true;
             }
             if (typeof stopSidebarLayoutBodyClassObserver === 'function') {
                 stopSidebarLayoutBodyClassObserver();
@@ -5024,11 +5052,53 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             clearTimeout(resizeTimeout);
             resizeTimeout = setTimeout(checkSidebarResponsiveWidth, 150);
         });
-        
+
         // Check initial state
         checkSidebarResponsiveWidth();
     }
-    
+
+    // Re-check the non-chat-page restriction after SPA navigation. Settings changes
+    // force a full reload (so the init-time check at startup is normally sufficient),
+    // but clicking around the site (e.g. chat -> chatbot/edit) is client-side routing
+    // that never reloads the page. Without this, the sidebar CSS injected on a chat
+    // page stayed active after navigating to chatbot/edit, pinning modals like
+    // "Attach Lorebook" into the 380px sidebar panel and hiding their action buttons.
+    function applySidebarLayoutPageState() {
+        if (!sidebarUserEnabled) return;
+        const nonChatPage = isNonChatPageForSidebar();
+        if (nonChatPage && !sidebarPageDisabled) {
+            sidebarPageDisabled = true;
+            toggleSidebarLayout(false, false);
+        } else if (!nonChatPage && sidebarPageDisabled) {
+            sidebarPageDisabled = false;
+            if (!sidebarAutoDisabled) {
+                toggleSidebarLayout(true, false);
+            }
+        }
+    }
+
+    // Deliberately polls location.pathname instead of patching history.pushState/
+    // replaceState. Tried that first, but SpicyChat's own router reassigns
+    // history.pushState after this content script runs (confirmed live: even a raw
+    // `history.pushState(...)` call from the console stopped reaching a wrapper
+    // installed here), so a patched version never actually saw real in-app
+    // navigation (e.g. the chat header's "Edit Chatbot" menu item) fire it — it
+    // silently never fired. `window.navigation` (the newer Navigation API) is
+    // present in this browser too, which is likely what the site's router uses
+    // instead of history.pushState — but that API doesn't exist in Firefox, which
+    // this extension also ships to. Polling is slightly delayed but framework- and
+    // browser-agnostic: it doesn't care how the URL changed underneath it.
+    function initSidebarLayoutPageWatcher() {
+        let lastPathname = window.location.pathname;
+        setInterval(() => {
+            const currentPathname = window.location.pathname;
+            if (currentPathname !== lastPathname) {
+                lastPathname = currentPathname;
+                applySidebarLayoutPageState();
+            }
+        }, 300);
+    }
+
     // Apply or remove theme customization CSS
     async function toggleClassicLayout(enable) {
         if (enable) {
@@ -5406,47 +5476,29 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
     async function toggleHideForYou(enable) {
         if (enable) {
             checkHideForYouPage();
-            
+
             if (!hideForYouUrlObserver) {
-                // Perf: a MutationObserver on document.body fires constantly during
-                // streaming. URL changes are driven by history.pushState/popstate, so
-                // listen for those directly and skip scanning every DOM mutation.
+                // Originally patched history.pushState/replaceState + listened for
+                // popstate, on the assumption that's how SpicyChat's SPA navigation
+                // changes the URL. Confirmed (while fixing an identical assumption in
+                // Sidebar Layout, see applySidebarLayoutPageState) that it isn't: the
+                // site's own router reassigns history.pushState after this content
+                // script runs, so a wrapper installed here never actually saw real
+                // in-app navigation fire it. Polling location.href is slightly
+                // delayed but doesn't depend on how the framework changes the URL.
                 let lastUrl = window.location.href;
-                const onUrlMaybeChanged = () => {
+                hideForYouUrlObserver = setInterval(() => {
                     const currentUrl = window.location.href;
                     if (currentUrl !== lastUrl) {
                         lastUrl = currentUrl;
-                        setTimeout(checkHideForYouPage, 100);
+                        checkHideForYouPage();
                     }
-                };
-                hideForYouUrlObserver = {
-                    _onPop: onUrlMaybeChanged,
-                    _origPush: history.pushState,
-                    _origReplace: history.replaceState,
-                    disconnect() {
-                        window.removeEventListener('popstate', this._onPop);
-                        if (history.pushState === this._patchedPush) history.pushState = this._origPush;
-                        if (history.replaceState === this._patchedReplace) history.replaceState = this._origReplace;
-                    }
-                };
-                window.addEventListener('popstate', onUrlMaybeChanged);
-                hideForYouUrlObserver._patchedPush = function(...args) {
-                    const r = hideForYouUrlObserver._origPush.apply(this, args);
-                    onUrlMaybeChanged();
-                    return r;
-                };
-                hideForYouUrlObserver._patchedReplace = function(...args) {
-                    const r = hideForYouUrlObserver._origReplace.apply(this, args);
-                    onUrlMaybeChanged();
-                    return r;
-                };
-                history.pushState = hideForYouUrlObserver._patchedPush;
-                history.replaceState = hideForYouUrlObserver._patchedReplace;
+                }, 300);
             }
         } else {
             stopHideForYou();
             if (hideForYouUrlObserver) {
-                hideForYouUrlObserver.disconnect();
+                clearInterval(hideForYouUrlObserver);
                 hideForYouUrlObserver = null;
             }
         }
@@ -6988,14 +7040,24 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                         }
                     }
                     
-                    // If still not found, try to find ANY enabled button near the textarea that's not disabled
+                    // If still not found, try to find ANY enabled button near the textarea that's not disabled.
+                    // Walk backwards from the last button so we skip known non-send controls
+                    // (voice/mic, autogenerate, image-gen) instead of blindly grabbing whatever
+                    // is visually last — on some mobile layouts (reported on Firefox Android)
+                    // a voice-record button sits after the send button in DOM order, so taking
+                    // the literal last enabled button was toggling the mic instead of sending.
                     if (!sendButton) {
                         const parentContainer = editor.closest('.flex.flex-col') || editor.parentElement;
                         if (parentContainer) {
-                            const allButtons = parentContainer.querySelectorAll('button:not([disabled])');
-                            // Take the last enabled button (likely the send button if only one is enabled)
-                            if (allButtons.length > 0) {
-                                sendButton = allButtons[allButtons.length - 1];
+                            const allButtons = Array.from(parentContainer.querySelectorAll('button:not([disabled])'));
+                            for (let i = allButtons.length - 1; i >= 0; i--) {
+                                const btn = allButtons[i];
+                                const ariaLabel = btn.getAttribute('aria-label') || '';
+                                if (ariaLabel !== 'record-voice' && ariaLabel !== 'autogenerate' &&
+                                    ariaLabel !== 'generate-image') {
+                                    sendButton = btn;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -7053,10 +7115,37 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 debugLog('[WYSIWYG] Focus handler SKIPPED due to resize in progress');
                 return;
             }
-            // Trigger immediate update if content changed externally
+            // Editor and textarea disagree — decide which side is authoritative before
+            // touching anything. This is the exact discriminator the value-check interval
+            // uses: `lastKnownValue` is the textarea value as of our last sync.
+            //
+            //   textarea.value !== lastKnownValue  → the TEXTAREA changed since we last
+            //     synced, i.e. an EXTERNAL actor wrote it (React draft-load, the "suggest"
+            //     feature, undo/redo, send-clear). The editor must catch up → rebuild it.
+            //
+            //   textarea.value === lastKnownValue  → the textarea is untouched since our
+            //     last sync, so the divergence is the EDITOR being the fresher side. That
+            //     is what Grammarly (or any similar extension) does: it edits the
+            //     contenteditable directly, which hasn't synced back to the textarea yet.
+            //     Rebuilding from the stale textarea here would (a) silently wipe the
+            //     correction and (b) destroy the very DOM nodes Grammarly is mid-
+            //     replacement on — observed in debug logs as Grammarly "replacement fail"
+            //     immediately after a "Focus handler calling initializeEditor" line. Sync
+            //     editor→textarea instead and let the debounced reformat run afterward.
+            //
+            // The earlier (1.2.4) attempt gated this on `lastInputTime` ("did the user type
+            // recently?"), but accepting a Grammarly suggestion involves no typing, so that
+            // guard was always false for the exact case it was meant to catch.
             if (textarea.value !== getPlainText()) {
-                debugLog('[WYSIWYG] Focus handler calling initializeEditor due to content change');
-                initializeEditor();
+                if (textarea.value !== lastKnownValue) {
+                    debugLog('[WYSIWYG] Focus handler: textarea changed externally, rebuilding editor');
+                    initializeEditor();
+                    lastKnownValue = textarea.value;
+                } else {
+                    debugLog('[WYSIWYG] Focus handler: editor is fresher (external contenteditable edit), syncing out instead of rebuilding');
+                    syncToTextarea();
+                    lastKnownValue = textarea.value;
+                }
             }
         });
         
@@ -7637,12 +7726,13 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         // Initialize sidebarUserEnabled for responsive sidebar tracking
         sidebarUserEnabled = sidebarEnabled;
-        
+
         // Sidebar Layout CSS is already injected early if enabled
         // Just get a reference to the existing element
         // BUT: Ensure it's disabled on non-chat pages (lorebook, chatbot, group)
         const shouldDisableSidebarLayout = isNonChatPageForSidebar();
-        
+        sidebarPageDisabled = sidebarEnabled && shouldDisableSidebarLayout;
+
         if (sidebarEnabled && !shouldDisableSidebarLayout) {
             sidebarStyleElement = document.getElementById('sai-toolkit-sidebar-layout-early');
             if (sidebarStyleElement) {
@@ -7659,6 +7749,14 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             if (typeof updateSidebarLayoutBodyClasses === 'function') {
                 updateSidebarLayoutBodyClasses();
             }
+            // Composer CSS shares Sidebar Layout's "chat pages only" gating (see
+            // toggleSidebarLayout) — mirror the same enable/disable handling here so
+            // it isn't stuck on whatever the very first early-inject check decided.
+            composerLayoutStyleElement = document.getElementById('sai-toolkit-composer-layout-early');
+            if (composerLayoutStyleElement) {
+                debugLog('[Core] Using early-injected Composer Layout CSS');
+                composerLayoutStyleElement.disabled = false;
+            }
         } else {
             // If disabled or on non-chat page, ensure early CSS is disabled
             const earlyElement = document.getElementById('sai-toolkit-sidebar-layout-early');
@@ -7667,11 +7765,19 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
                 sidebarStyleElement = earlyElement;
                 debugLog('[Core] Disabled early-injected Sidebar Layout CSS' + (shouldDisableSidebarLayout ? ' (non-chat page)' : ''));
             }
+            const earlyComposerElement = document.getElementById('sai-toolkit-composer-layout-early');
+            if (earlyComposerElement) {
+                earlyComposerElement.disabled = true;
+                composerLayoutStyleElement = earlyComposerElement;
+                debugLog('[Core] Disabled early-injected Composer Layout CSS' + (shouldDisableSidebarLayout ? ' (non-chat page)' : ''));
+            }
         }
         
         // Initialize responsive sidebar listener (handles auto-disable when page is narrow)
         initResponsiveSidebar();
-        
+        // Re-apply the non-chat-page restriction on SPA navigation (chat <-> chatbot/edit etc.)
+        initSidebarLayoutPageWatcher();
+
         // Classic Layout CSS is already injected early if enabled
         // Just get a reference to the existing element
         if (classicLayoutEnabled) {
@@ -15640,9 +15746,8 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         debugLog('[Stats] messageObserver attached to', host === document.body ? 'document.body (fallback)' : 'chat container');
     }
 
-    // Reattach on SPA navigation. Patch history methods + popstate so we get
-    // notified when the chat container is replaced. We delay the reattach a tick
-    // so React has a chance to mount the new container.
+    // Reattach on SPA navigation. We delay the reattach a tick so React has a
+    // chance to mount the new container.
     function scheduleReattachAfterNav() {
         setTimeout(() => {
             // If the current host is detached from the document, or we've moved
@@ -15666,20 +15771,26 @@ nav:not([style*="width: 54px"]) #sai-toolkit-sidebar-btn p {
         }, 500);
     }
 
+    // Originally patched history.pushState/replaceState + listened for popstate to
+    // detect SPA navigation. Confirmed live (switching from one chat to another via
+    // a real in-app link) that this never actually fired: the old container's host
+    // node was disconnected from the document, but a wrapper installed on
+    // history.pushState here never saw it happen, because SpicyChat's own router
+    // reassigns history.pushState after this content script runs. With the
+    // "Periodic check to ensure stats are inserted" fallback below disabled, that
+    // meant the message observer could get permanently stuck watching a detached
+    // node after switching chats, silently breaking stats/timestamps/message IDs
+    // until a full page reload. Polling location.href is slightly delayed but
+    // doesn't depend on how the framework changes the URL.
     (function installNavHooks() {
-        const origPush = history.pushState;
-        const origReplace = history.replaceState;
-        history.pushState = function (...args) {
-            const r = origPush.apply(this, args);
-            scheduleReattachAfterNav();
-            return r;
-        };
-        history.replaceState = function (...args) {
-            const r = origReplace.apply(this, args);
-            scheduleReattachAfterNav();
-            return r;
-        };
-        window.addEventListener('popstate', scheduleReattachAfterNav);
+        let lastHref = window.location.href;
+        setInterval(() => {
+            const currentHref = window.location.href;
+            if (currentHref !== lastHref) {
+                lastHref = currentHref;
+                scheduleReattachAfterNav();
+            }
+        }, 300);
     })();
 
     // Initial attach: wait for body, then bind to chat container if present.

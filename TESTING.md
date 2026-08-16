@@ -43,6 +43,14 @@ Don't let it drift from what the extension actually does.
   - [ ] Shrink the window below ~999px wide — confirm the character info bar's
         background still extends edge-to-edge behind the (now-collapsed) left
         nav, same as before this was scoped to mobile-only
+  - [ ] With Sidebar Layout enabled on a chat page, click through to a bot's
+        edit page (`/chatbot/edit/*`) via a SpicyChat link (not a manual URL
+        paste, so it's SPA navigation) — confirm the page looks normal and
+        "Attach Lorebook" shows its Cancel/Attach buttons; then click back to
+        the chat page and confirm Sidebar Layout is still active there (this
+        was a real bug once — the sidebar CSS only got re-checked against the
+        URL on full page load, not on SPA navigation —
+        [content.js:5066](content.js#L5066))
 - [ ] **Classic Chat Layout** — messages center into a single column
 - [ ] **Small Profile Images** — avatars shrink
 - [ ] **Rounded Profile Images** — avatars become circular
@@ -94,9 +102,20 @@ Don't let it drift from what the extension actually does.
 ## 3. Features tab
 
 - [ ] **Hide "For You" Characters**
+  - [ ] Enable it on page 1 of the home grid, then SPA-navigate away (into a
+        chat) and back to page 1 **without reloading** — confirm the "For You"
+        tiles are still hidden. This was driven by a `history.pushState` hook
+        that never fired (SpicyChat's router reassigns `pushState`); it now
+        polls the URL — [content.js:5476](content.js#L5476)
 - [ ] **Page Jump Modal**
 - [ ] **Show Generation Stats** (+ sub: full model details, compact stats)
 - [ ] **Show Timestamps** (+ sub: date-first order, 24-hour time)
+  - [ ] **Switch directly from one chat to another** via an in-app link (SPA
+        navigation, no reload) and confirm stats/timestamps still appear on the
+        second chat's messages **and** on newly generated ones. The message
+        observer's reattach-after-navigation was previously stuck on the old
+        chat's detached container (same inert-`pushState` root cause), silently
+        killing stats until a full reload — [content.js:15785](content.js#L15785)
 - [ ] **Show Message IDs**
 - [ ] **Highlight Model Changes** — actually switch models mid-chat, confirm
       the yellow border appears
@@ -164,6 +183,19 @@ This has broken in subtle, hard-to-notice ways more than once. Test all of:
       correction a few times in a row — the correction replaces the original
       text; it should never end up duplicated (correction glued in front of
       the original) even after several repeats
+- [ ] With Grammarly enabled, trigger a small in-place suggestion (e.g. a
+      missing comma, or lowercase "i" that should be capitalized) — accepting
+      it should actually change the text, not silently do nothing. Try it
+      right after typing (composer still "warm") as well as after pausing a
+      few seconds first
+- [ ] With Grammarly enabled, click away from the composer to interact with a
+      suggestion popup, then click back into the composer to keep typing —
+      whatever the popup did to the text should still be there, not reverted
+      back to what it was before
+- [ ] On Android (or any mobile layout where the composer's bottom-right
+      button can show a voice/mic icon instead of send): with text typed,
+      press Enter/Return on the on-screen keyboard — it should send the
+      message, not toggle voice input
 
 ## 6. Generation Settings integration
 
