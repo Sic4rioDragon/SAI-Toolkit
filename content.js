@@ -6553,7 +6553,21 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             // Clone to avoid modifying the actual DOM
             const clone = editor.cloneNode(true);
             
-            // Replace <br> with newlines
+            // Chromium uses a lone <br> inside an otherwise-empty block as a
+            // placeholder for a blank line. The block boundary already represents
+            // that line break, so counting the placeholder <br> as another newline
+            // would add an extra blank line when pasting/editing multi-paragraph text.
+            clone.querySelectorAll('div, p').forEach(block => {
+                const childNodes = Array.from(block.childNodes);
+                const isPlaceholderOnly = childNodes.length === 1 &&
+                    childNodes[0].nodeType === Node.ELEMENT_NODE &&
+                    childNodes[0].tagName === 'BR';
+                if (isPlaceholderOnly) {
+                    childNodes[0].remove();
+                }
+            });
+            
+            // Replace real <br> elements with newlines
             clone.querySelectorAll('br').forEach(br => {
                 br.replaceWith('\n');
             });
