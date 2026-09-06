@@ -5832,6 +5832,20 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
             border-radius: 2px;
         }
         
+        /* Horizontal separator: a standalone --- line, matching SpicyChat mobile */
+        .sai-wysiwyg-editor .wysiwyg-horizontal-rule {
+            display: inline-block;
+            width: 100%;
+            height: 1em;
+            color: transparent !important;
+            vertical-align: middle;
+            background: linear-gradient(
+                var(--wysiwyg-body-color),
+                var(--wysiwyg-body-color)
+            ) center / 100% 1px no-repeat;
+            opacity: 0.45;
+        }
+        
         /* Hide the original textarea when WYSIWYG is active */
         /* Use position:absolute and zero dimensions to take it out of flex flow completely */
         textarea.sai-wysiwyg-hidden {
@@ -6014,6 +6028,19 @@ div.flex.items-end.gap-sm.w-full[style*="margin-left"] {
         
         while (i < len) {
             const char = text[i];
+            
+            // Standalone --- line: render the same full-width separator shown on mobile.
+            // Keep the literal --- inside the span so syncing back to SpicyChat preserves
+            // the original message text exactly.
+            const isLineStart = i === 0 || text[i - 1] === '\n';
+            if (isLineStart && text.startsWith('---', i)) {
+                const afterRule = text[i + 3];
+                if (afterRule === undefined || afterRule === '\n' || afterRule === '\r') {
+                    result.push('<span class="wysiwyg-horizontal-rule">---</span>');
+                    i += 3;
+                    continue;
+                }
+            }
             
             // Check for highlight: `text`
             if (char === '`') {
